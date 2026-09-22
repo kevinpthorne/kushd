@@ -1,112 +1,143 @@
 # Kushd (Kubernetes Shutdown Daemon) Engineering Specification
 
-**Document Version:** 1.0.0-RC1
+**Document Version:** 1.0.0-RC2
 
-**Status:** Under Review
+**Status:** Ready for Review
 
 **Target Environments:** Bare-Metal & Edge Kubernetes (v1.28+)
 
-**Primary Subsystems:** Hardware Telemetry (`kushd-trigger`), Cluster State Reconciler (`kushd-controller`), Host Node Daemon (`kushd-agent`)
+**Primary Subsystems:** Consolidated Controller (`kushd-controller`), Host Node Daemon (`kushd-agent`)
 
 ---
 
-## 1. Executive Summary & System Invariants
+## 1. Executive Summary & Core Invariants
 
-Kushd is a distributed, event-driven shutdown orchestrator for Kubernetes clusters operating behind Uninterruptible Power Supply (UPS) hardware. Abrupt power failure poses catastrophic risks to stateful workloads: `etcd` consensus corruption, write-cache truncation on persistent volumes (Ceph, Longhorn, local storage), and ungraceful pod termination.
+Kushd is a topology-aware, event-driven shutdown orchestrator for Kubernetes clusters operating behind Uninterruptible Power Supply (UPS) hardware. Abrupt power loss risks stateful corruption: `etcd` consensus split-brain, write-cache truncation on persistent volumes (Ceph, Longhorn, local block devices), and ungraceful pod termination.
 
-Kushd enforces an ordered, priority-aware decommission of the cluster down to the host OS level (`systemd`), while explicitly providing configurable protection for shared rack infrastructure (e.g., switches, modems, routers, storage appliances).
-
-### Core Invariants
-
-1. **Topology Placement Invariant:** Physical UPS communication hardware (USB/Serial via RJ45) **must** terminate on a control-plane node. Kushd enforces an in-process, fail-fast panic if the UPS device is bound to a worker node, eliminating premature telemetry severance during worker eviction.
-2. **Asymmetric Phasing:** Worker nodes must completely evacuate and halt before control-plane nodes initiate decommissioning.
-3. **Quorum Preservation:** Control-plane nodes must decommission sequentially ($N-1 \to \text{Final}$). The node hosting the active `kushd-controller` leader must remain online as the final cluster host.
-4. **Point-of-No-Return:** Once worker node eviction begins, power-restoration abort sequences are rejected to prevent partitioned states across partially dismantled cluster topologies.
-5. **Configurable Power Cut (`killpower`):** Kushd defaults to `enableKillpower: false` to allow auxiliary rack infrastructure (networking, NAS) to remain on battery reserves. Cutting physical UPS load power is treated as an explicit, opt-in administrative setting.
-
----
-
-## 2. System Architecture
+Kushd enforces an ordered, priority-aware decommission sequence down to the host OS level (`systemd`), while explicitly protecting shared rack infrastructure (networking, storage appliances) through an opt-in power-cut model.
 
 ```
-                  ┌─────────────────────────────────────────────────────┐
-                  │                 Control Plane Node                  │
-                  │                                                     │
-[UPS Hardware] ──►│ [kushd-trigger]                                     │
- (USB/Serial RJ45)│       │ (Validates CP role; Panics if on worker)    │
-                  │       ▼                                             │
-                  │ [ClusterShutdown CR]                                │
-                  │       │                                             │
-                  │       ▼                                             │
-                  │ [kushd-controller] (Leader)                         │
-                  └───────┬─────────────────────────────┬───────────────┘
-                          │                             │
-             Phase 1: Worker Nodes         Phase 2: Control Plane
-                          │                             │
-                          ▼                             ▼
-                 ┌─────────────────┐           ┌─────────────────┐
-                 │   kushd-agent   │           │   kushd-agent   │
-                 │  (Worker Node)  │           │  (CP Follower)  │
-                 └────────┬────────┘           └────────┬────────┘
-                          ▼                             ▼
-                 [systemd / D-Bus]             [systemd / D-Bus]
-                 [Host Poweroff  ]             [Host Poweroff  ]
+                      [UPS Hardware]
+                      (USB / Serial)
+                            │ (Mounted via /dev/ups0)
+                            ▼
+              ┌───────────────────────────┐
+              │ Control Plane Anchor Node │
+              │                           │
+              │     kushd-controller      │
+              │  (Poller + Reconciler)    │
+              └─────────────┬─────────────┘
+                            │
+               Phase 1: Worker Nodes (Parallel)
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │   kushd-agent   │
+                   │  (Worker Node)  │
+                   └────────┬────────┘
+                            ▼
+                   [systemd / D-Bus]
+                   [Host Poweroff  ]
+                            │
+               Phase 2: Control Plane (Sequential N-1)
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │   kushd-agent   │
+                   │  (CP Follower)  │
+                   └────────┬────────┘
+                            ▼
+                   [systemd / D-Bus]
+                   [Host Poweroff  ]
+                            │
+               Phase 3: Final Anchor Decommission
+                            │
+                            ▼
+                 [Optional UPS Killpower]
+                 [Anchor Host Poweroff  ]
 
 ```
 
-### Component Roles
+### System Invariants
 
-* **`kushd-trigger`**: Hardware monitoring daemon. Interfaces with the UPS via Network UPS Tools (NUT) or raw USB HID. Detects power events (`ONBATT`, `LOWBATT`), tracks voltage/runtime trends, and creates the `ClusterShutdown` custom resource.
-* **`kushd-controller`**: Clustered control-plane reconciler (leader elected). Watches `ClusterShutdown` CRs, drives the global shutdown state machine, calculates drain timeouts, cordons nodes, and sets lifecycle annotations.
-* **`kushd-agent`**: Privileged host-integrated DaemonSet. Watches local `Node` metadata annotations, drains local pods, coordinates with `systemd-logind` via D-Bus, syncs dirty disk buffers, and executes host halts.
+1. **Topology Placement Invariant:** Physical UPS communication hardware (USB/Serial) **must** terminate on a control-plane node. Kushd enforces an in-process, clean exit (`os.Exit(1)`) without stack trace pollution if scheduled on a worker node.
+2. **Anchor-Node Architecture (No Leader Election):** `kushd-controller` runs as a single, pinned replica on the control-plane node hosting the UPS cable. Dynamic leader election is banned: standard Kubernetes Lease mechanisms deadlock as `etcd` members power down during cluster evacuation.
+3. **Unified Manager Process:** Hardware telemetry polling, cluster state reconciliation, and final hardware power cuts execute within a single container (`kushd-controller`), eliminating inter-process communication over failing networks or degrading `etcd` clusters.
+4. **Point-of-No-Return:** Once worker node evacuation begins, abort sequences are rejected. The cluster must reach full poweroff to prevent partitioned states across partially dismantled cluster topologies.
+5. **Configurable Power Cut (`killpower`):** Kushd defaults to `enableKillpower: false` to allow auxiliary rack infrastructure (switches, routers, NAS) to continue running on battery reserves. Cutting physical UPS load power is treated as an explicit, opt-in administrative setting.
 
 ---
 
-## 3. The Topology Guard: In-Process Trigger Panic
+## 2. Component Architecture
 
-Connecting the UPS communication link to a worker node introduces an immediate race condition: worker nodes are evacuated and halted *first*, destroying telemetry and abort controls midway through the sequence.
+### 2.1 `kushd-controller` (Single-Replica Manager)
 
-`kushd-trigger` blocks this configuration at startup by inspecting its local node topology via the Kubernetes API.
+Deployed as a single-pod `Deployment` pinned to the physical UPS host via `nodeSelector`. It runs two concurrent loops within a single Go binary:
+
+* **Hardware Poller Routine:** Continually polls battery metrics over a persistent device path (`/dev/ups0`) via NUT or direct USB HID. Detects power transitions (`ONBATT`, `LOWBATT`) and creates or reconciles the `ClusterShutdown` Custom Resource.
+* **Cluster Reconciler Routine:** Watches `ClusterShutdown` resources, manages the phase state machine, cordons nodes, dispatches stage annotations to `kushd-agent` instances, monitors node health, and executes final anchor host poweroff.
+
+### 2.2 `kushd-agent` (Privileged DaemonSet)
+
+Runs as a privileged DaemonSet on all nodes. Mounts the host D-Bus system socket and host root filesystem. It:
+
+* Watches its local `Node` object annotations (`kushd.io/stage`).
+* Executes local pod evictions, automatically escalating to forceful deletion if PodDisruptionBudgets (PDBs) block shutdown progress.
+* Flushes dirty filesystem buffers via a timeout-bounded synchronization wrapper.
+* Issues `org.freedesktop.systemd1.Manager.PowerOff` to the host systemd daemon.
+
+---
+
+## 3. Hardware & Startup Validation
+
+### 3.1 Persistent Device Symlinking
+
+To survive Linux USB re-enumeration (e.g., `/dev/ttyUSB0` changing to `/dev/ttyUSB1` after transient brownouts), the host must expose a predictable udev path.
+
+**Host udev Rule (`/etc/udev/rules.d/99-ups.rules`):**
+
+```udev
+SUBSYSTEM=="usb", ATTRS{idVendor}=="051d", ATTRS{idProduct}=="0002", SYMLINK+="ups0", MODE="0660", GROUP="dialout"
+
+```
+
+### 3.2 Startup Topology Guard
+
+On initialization, `kushd-controller` validates that its hosting node carries the control-plane role. Violations log structured JSON errors and terminate cleanly with exit code 1 to induce a clean `CrashLoopBackOff` without Go runtime stack dump noise.
 
 ```go
 package main
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"os"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 )
 
-func assertControlPlaneTopology(ctx context.Context, client kubernetes.Interface, nodeName string) {
+func validateAnchorTopologyOrExit(ctx context.Context, client kubernetes.Interface, nodeName string) {
 	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		panic(fmt.Sprintf("FATAL: kushd-trigger cannot retrieve node metadata: %v", err))
+		slog.Error("Failed to retrieve node metadata during topology validation", "error", err)
+		os.Exit(1)
 	}
 
 	_, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
 	_, isMaster := node.Labels["node-role.kubernetes.io/master"]
 
 	if !isControlPlane && !isMaster {
-		fmt.Fprintf(os.Stderr, "FATAL_TOPOLOGY_VIOLATION: UPS cable detected on worker node %q. "+
-			"kushd-trigger must run strictly on a control-plane node to prevent premature power severance "+
-			"during worker node drain phases. Halting startup immediately.\n", nodeName)
-		
-		// In-process panic triggers an exit code 1, inducing CrashLoopBackOff
-		panic("TOPOLOGY_MISMATCH_WORKER_ATTACHED_UPS")
+		slog.Error("FATAL: Topology Invariant Violated",
+			"error", "UPS_ATTACHED_TO_WORKER",
+			"node", nodeName,
+			"remediation", "Move physical UPS USB/Serial cable to a designated control-plane node",
+		)
+		os.Exit(1)
 	}
 }
 
 ```
-
-### Failure Modes & Observability
-
-* Pod enters `CrashLoopBackOff` immediately upon scheduling on a worker.
-* Log aggregation engines index the structured string `FATAL_TOPOLOGY_VIOLATION`.
-* No `ClusterShutdown` custom resource can be emitted from an invalid host.
 
 ---
 
@@ -150,6 +181,10 @@ spec:
                   maximum: 100
                 estimatedRuntimeSeconds:
                   type: integer
+                abort:
+                  type: boolean
+                  default: false
+                  description: "Manual override to cancel shutdown if set before Point-of-No-Return."
                 dryRun:
                   type: boolean
                   default: false
@@ -159,14 +194,13 @@ spec:
                     enableKillpower:
                       type: boolean
                       default: false
-                      description: "Instructs the UPS to schedule a hard load cut. If false, nodes power off but UPS outlets remain energized."
+                      description: "Instructs the UPS to cut load power after node halts."
                     killpowerDelaySeconds:
                       type: integer
                       default: 60
                     targetOutletGroup:
                       type: string
                       default: ""
-                      description: "Optional addressable outlet bank (e.g. '1'). Blank targets the whole UPS."
                 timeouts:
                   type: object
                   properties:
@@ -190,6 +224,7 @@ spec:
                     - HaltingControlPlane
                     - Finalizing
                     - Completed
+                    - Aborted
                     - Failed
                 observedGeneration:
                   type: integer
@@ -199,7 +234,7 @@ spec:
                 completionTime:
                   type: string
                   format: date-time
-                activeLeaderNode:
+                anchorNode:
                   type: string
                 conditions:
                   type: array
@@ -222,8 +257,6 @@ spec:
 
 ### 4.2 Node Annotation Interface
 
-The controller and agents communicate asynchronously via atomic updates to `Node` object annotations:
-
 | Annotation Key | Values | Direction | Operational Meaning |
 | --- | --- | --- | --- |
 | `kushd.io/stage` | `idle`, `drain`, `halt` | Controller $\to$ Agent | Target lifecycle state command. |
@@ -234,85 +267,82 @@ The controller and agents communicate asynchronously via atomic updates to `Node
 ## 5. Orchestration State Machine
 
 ```
-   [Trigger Event]
-          │
-          ▼
-   ┌───────────────┐
-   │    Pending    │  Validate CR integrity, elect leader, check locks
-   └──────┬────────┘
-          │
-          ▼
- ┌─────────────────┐
- │ CordoningCluster│  Apply spec.unschedulable = true across ALL nodes
- └────────┬────────┘
-          │
-          ▼
- ┌─────────────────┐
- │ DrainingWorkers │  Set kushd.io/stage: drain on worker nodes
- └────────┬────────┘
-          │ (All workers report "drained" OR timeout expires)
-          ▼
- ┌─────────────────┐
- │ HaltingWorkers  │  Set kushd.io/stage: halt on worker nodes
- └────────┬────────┘
-          │ (All workers transition to NotReady / offline)
-          ▼
-┌──────────────────────┐
-│ DrainingControlPlane │  Set kushd.io/stage: drain on (N-1) CP follower nodes
-└─────────┬────────────┘
-          │ (Followers report "drained")
-          ▼
-┌──────────────────────┐
-│ HaltingControlPlane  │  Halt (N-1) CP nodes; active leader host stays online
-└─────────┬────────────┘
-          │
-          ▼
-   ┌───────────────┐
-   │  Finalizing   │  Flush local buffers; conditional killpower command
-   └──────┬────────┘
-          │
-          ▼
-   ┌───────────────┐
-   │   Completed   │  Leader node executes systemd PowerOff()
-   └───────────────┘
+                      [Trigger Event: LOWBATT]
+                                  │
+                                  ▼
+                           ┌─────────────┐
+                   ┌───────┤   Pending   │◄──────┐
+                   │       └──────┬──────┘       │
+                   │              │              │
+Mains Restored(OL) │              ▼              │ Mains Restored (OL)
+[spec.abort: true] │     ┌─────────────────┐     │ [spec.abort: true]
+                   │     │ CordoningCluster│─────┘
+                   │     └────────┬────────┘
+                   │              │
+                   │              ▼ ─── [POINT OF NO RETURN] ───
+                   │     ┌─────────────────┐
+                   │     │ DrainingWorkers │ (Evictions dispatched;
+                   │     └────────┬────────┘  Aborts rejected)
+                   │              │
+                   │              ▼
+                   │     ┌─────────────────┐
+                   │     │ HaltingWorkers  │
+                   │     └────────┬────────┘
+                   │              │
+                   │              ▼
+                   │   ┌──────────────────────┐
+                   │   │ DrainingControlPlane │ (N-1 Followers)
+                   │   └──────────┬───────────┘
+                   │              │
+                   │              ▼
+                   │   ┌──────────────────────┐
+                   │   │ HaltingControlPlane  │ (N-1 Followers)
+                   │   └──────────┬───────────┘
+                   │              │
+                   │              ▼
+                   │       ┌─────────────┐
+                   │       │ Finalizing  │ (Anchor Disk Sync &
+                   │       └──────┬──────┘  Optional Killpower)
+                   │              │
+                   │              ▼
+                   ▼       ┌─────────────┐
+           ┌───────────┐   │  Completed  │ (Anchor Host Halts)
+           │  Aborted  │   └─────────────┘
+           │(Uncordon) │
+           └───────────┘
 
 ```
 
-### Shared Loads & The Killpower Decision
+### 5.1 Phase Transitions
 
-```
-                 [Finalizing Phase]
-                         │
-        /────────────────────────────────\
-       <   spec.powerManagement.          >
-       <   enableKillpower == true?       >
-        \────────────────────────────────/
-               │                    │
-            YES│                    │NO
-               ▼                    ▼
-   ┌──────────────────────┐  ┌───────────────────────────────────┐
-   │ Issue UPS shutdown   │  │ Bypass UPS load cut.              │
-   │ command with delay.  │  │ Shared loads (switches, modems)   │
-   │ Outlets cut off.     │  │ remain energized on battery.      │
-   └───────────┬──────────┘  └─────────────────┬─────────────────┘
-               │                               │
-               └───────────────┬───────────────┘
-                               │
-                               ▼
-            ┌────────────────────────────────────┐
-            │ Leader host calls PowerOff()       │
-            └────────────────────────────────────┘
+| Phase | Entry Condition | Action Taken | Next Phase |
+| --- | --- | --- | --- |
+| **Pending** | CR Created / Battery Critical | Validate anchor node locks and read configuration. | `CordoningCluster` |
+| **CordoningCluster** | Phase == Pending | Set `spec.unschedulable: true` on **all** cluster nodes. | `DrainingWorkers` |
+| **DrainingWorkers** | Phase == CordoningCluster | Set `kushd.io/stage: drain` on all worker nodes. Point-of-No-Return crossed. | `HaltingWorkers` |
+| **HaltingWorkers** | Workers report `drained` OR `workerEvacuationSeconds` expires | Set `kushd.io/stage: halt` on worker nodes. Controller waits for workers to report `NotReady` or disconnect. | `DrainingControlPlane` |
+| **DrainingControlPlane** | All worker nodes offline | Set `kushd.io/stage: drain` on non-anchor control-plane nodes sequentially. | `HaltingControlPlane` |
+| **HaltingControlPlane** | Followers drained | Set `kushd.io/stage: halt` on non-anchor control-plane nodes. | `Finalizing` |
+| **Finalizing** | Followers offline | Anchor agent syncs storage. If `enableKillpower: true`, controller schedules hardware cut. | `Completed` |
+| **Completed** | Finalizing complete | Anchor host calls D-Bus `PowerOff()`. Terminal state. | — |
+| **Aborted** | Power restored or `spec.abort: true` before Point-of-No-Return | Remove cordon (`spec.unschedulable: false`) across all nodes. Remove stage annotations. | Terminal |
 
-```
+### 5.2 Two-Stage Evacuation & PDB Escalation
 
-* **When `enableKillpower: true**`: Suitable for dedicated compute racks. Once the leader host halts, the UPS cuts power. Upon mains power restoration, the motherboards detect AC power return and auto-power-on via BIOS configuration.
-* **When `enableKillpower: false` (Default)**: Prevents killing shared infrastructure (e.g., WAN routers, network switches, ambient low-power monitors). Compute hosts remain in soft-off (`S5`), and require Wake-on-LAN (WoL) or BMC/IPMI triggers once mains power stabilizes.
+Standard eviction calls can block indefinitely on strict PodDisruptionBudgets (PDBs) or stateful storage daemons (e.g., Ceph OSDs, Longhorn replicas). `kushd-agent` implements a dual-stage eviction loop:
+
+1. **Polite Eviction (0% to 75% of `workerEvacuationSeconds`):**
+Issues Kubernetes Eviction requests (`/api/v1/namespaces/{ns}/pods/{name}/eviction`). Respects PDB constraints and honors individual workload `terminationGracePeriodSeconds`.
+2. **Forceful Evacuation (75% to 100% of `workerEvacuationSeconds`):**
+If pods remain on the node, the agent escalates to direct pod deletion (`DELETE /api/v1/namespaces/{ns}/pods/{name}`) with `gracePeriodSeconds: 0`. This overrides failing storage pods and broken disruption budgets to ensure the host can decommission before battery failure.
 
 ---
 
-## 6. Node Agent & Host Power Execution
+## 6. Host Integration & Agent Mechanics
 
-The `kushd-agent` interacts with the host system through the native systemd D-Bus IPC socket (`/var/run/dbus/system_bus_socket`), bypassing shell wrapper overhead.
+### 6.1 Non-Blocking Host Buffer Synchronization
+
+Synchronous `syscall.Sync()` invocations can deadlock indefinitely if network-attached filesystems (NFS, Ceph, iSCSI) become unresponsive due to network switches dropping power. `kushd-agent` isolates filesystem synchronization inside a bounded goroutine with a 5-second deadline.
 
 ```go
 package main
@@ -320,7 +350,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"syscall"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 )
@@ -338,24 +370,39 @@ func NewHostPowerController() (*HostPowerController, error) {
 }
 
 func (h *HostPowerController) HaltHost(ctx context.Context) error {
-	// Synchronously flush all dirty block buffers to persistent storage
-	syscall.Sync()
+	slog.Info("Initiating host storage buffer sync...")
 
+	// Execute storage sync with a strict 5-second deadline to prevent network hangs
+	syncDone := make(chan struct{})
+	go func() {
+		syscall.Sync()
+		close(syncDone)
+	}()
+
+	select {
+	case <-syncDone:
+		slog.Info("Storage buffers successfully synced to disk")
+	case <-time.After(5 * time.Second):
+		slog.Warn("Storage sync timed out after 5s; proceeding with halt to prevent power depletion")
+	}
+
+	slog.Info("Invoking systemd PowerOff via D-Bus...")
 	systemd := h.conn.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
 	
-	// 'replace' job mode cancels existing jobs and executes immediate shutdown
+	// 'replace' job mode cancels pending unit transactions and triggers instant poweroff
 	call := systemd.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.PowerOff", 0)
 	if call.Err != nil {
-		return fmt.Errorf("D-Bus PowerOff invocation failed: %w", call.Err)
+		return fmt.Errorf("systemd D-Bus invocation failed: %w", call.Err)
 	}
+
 	return nil
 }
 
 ```
 
-### Secondary Fallback Execution
+### 6.2 Secondary Execution Fallback
 
-If D-Bus is unreachable due to socket corruption or service failures, `kushd-agent` falls back to direct chroot execution:
+If the D-Bus socket is unresponsive, the agent falls back to direct chroot execution:
 
 ```bash
 chroot /host /usr/bin/systemctl poweroff --force --force
@@ -364,15 +411,18 @@ chroot /host /usr/bin/systemctl poweroff --force --force
 
 ---
 
-## 7. Packaging: Nix-Based Container Images
+## 7. Packaging: Minimal Nix Container Images
 
-Kushd container images are constructed using **Nix `dockerTools**` via flakes. This produces minimal, bit-for-bit reproducible, unbloated container layers containing strictly the compiled static Go binary, IANA TLS certificates, and essential host D-Bus bindings.
+Container images are compiled with **Nix flakes** using `dockerTools.buildLayeredImage`.
+
+* `kushd-controller` includes static binaries, IANA TLS certificates, and NUT libraries for hardware communication.
+* `kushd-agent` is strictly lean; redundant `systemd` packages are omitted since fallback routines execute via `chroot` against the host's `/usr/bin/systemctl`.
 
 ### `flake.nix`
 
 ```nix
 {
-  description = "Kushd (Kubernetes Shutdown Daemon) Container Suite";
+  description = "Kushd Container Image Flake";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
@@ -384,22 +434,19 @@ Kushd container images are constructed using **Nix `dockerTools**` via flakes. T
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # Build statically linked Go binaries
         buildKushdBin = name: pkgs.buildGoModule {
           pname = name;
-          version = "0.1.0";
+          version = "1.2.0";
           src = ./.;
           subPackages = [ "cmd/${name}" ];
-          vendorHash = null; # Set appropriate vendor hash
+          vendorHash = null;
           CGO_ENABLED = 0;
           ldflags = [ "-s" "-w" "-extldflags '-static'" ];
         };
 
         kushdController = buildKushdBin "kushd-controller";
         kushdAgent = buildKushdBin "kushd-agent";
-        kushdTrigger = buildKushdBin "kushd-trigger";
 
-        # Base layered container construction
         buildKushdImage = { name, package, extraContents ? [] }:
           pkgs.dockerTools.buildLayeredImage {
             inherit name;
@@ -419,17 +466,11 @@ Kushd container images are constructed using **Nix `dockerTools**` via flakes. T
           controller-image = buildKushdImage {
             name = "kushd-controller";
             package = kushdController;
+            extraContents = [ pkgs.nut ];
           };
           agent-image = buildKushdImage {
             name = "kushd-agent";
             package = kushdAgent;
-            # Include systemd client tooling for fallback routines
-            extraContents = [ pkgs.systemd ];
-          };
-          trigger-image = buildKushdImage {
-            name = "kushd-trigger";
-            package = kushdTrigger;
-            extraContents = [ pkgs.nut ];
           };
         };
       }
@@ -440,45 +481,9 @@ Kushd container images are constructed using **Nix `dockerTools**` via flakes. T
 
 ---
 
-## 8. Deployment: Helm Chart Architecture
+## 8. Deployment: Helm Chart Specification
 
-### 8.1 Chart Directory Layout
-
-```
-charts/kushd/
-├── Chart.yaml
-├── values.yaml
-├── crds/
-│   └── clustershutdowns.kushd.io.yaml
-└── templates/
-    ├── _helpers.tpl
-    ├── rbac-controller.yaml
-    ├── rbac-agent.yaml
-    ├── deployment-controller.yaml
-    ├── daemonset-agent.yaml
-    └── deployment-trigger.yaml
-
-```
-
-### 8.2 `Chart.yaml`
-
-```yaml
-apiVersion: v2
-name: kushd
-description: Kubernetes Shutdown Daemon - Topology-Aware UPS Orchestrator
-type: application
-version: 0.1.0
-appVersion: "0.1.0"
-kubeVersion: ">=1.26.0"
-keywords:
-  - power-management
-  - ups
-  - bare-metal
-  - high-availability
-
-```
-
-### 8.3 `values.yaml`
+### 8.1 Values Manifest (`charts/kushd/values.yaml`)
 
 ```yaml
 global:
@@ -486,10 +491,21 @@ global:
   imagePullPolicy: IfNotPresent
 
 controller:
-  replicaCount: 2
+  # Strictly single replica pinned to the physical UPS anchor host
+  replicaCount: 1
   image:
     repository: kushd-controller
-    tag: v0.1.0
+    tag: v1.2.0
+  upsDevice:
+    port: "/dev/ups0"
+    driver: "usbhid-ups"
+  powerManagement:
+    enableKillpower: false
+    killpowerDelaySeconds: 60
+    targetOutletGroup: ""
+  thresholds:
+    batteryLowPercent: 20
+    runtimeLowSeconds: 300
   resources:
     limits:
       cpu: 100m
@@ -499,6 +515,7 @@ controller:
       memory: 64Mi
   nodeSelector:
     node-role.kubernetes.io/control-plane: ""
+    kushd.io/ups-anchor: "true"
   tolerations:
     - key: "node-role.kubernetes.io/control-plane"
       operator: "Exists"
@@ -510,7 +527,10 @@ controller:
 agent:
   image:
     repository: kushd-agent
-    tag: v0.1.0
+    tag: v1.2.0
+  hostPID: true
+  securityContext:
+    privileged: true
   hostRootPath: /
   dbusSocketPath: /run/dbus/system_bus_socket
   tolerations:
@@ -523,44 +543,122 @@ agent:
       cpu: 10m
       memory: 32Mi
 
-trigger:
-  enabled: true
-  image:
-    repository: kushd-trigger
-    tag: v0.1.0
-  upsDevice:
-    name: "ups"
-    driver: "usbhid-ups"
-    port: "auto"
-  powerManagement:
-    enableKillpower: false
-    killpowerDelaySeconds: 60
-    targetOutletGroup: ""
-  thresholds:
-    batteryLowPercent: 20
-    runtimeLowSeconds: 300
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
-  tolerations:
-    - key: "node-role.kubernetes.io/control-plane"
-      operator: "Exists"
-      effect: "NoSchedule"
+```
+
+### 8.2 Controller Deployment (`charts/kushd/templates/deployment-controller.yaml`)
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kushd.fullname" . }}-controller
+  labels:
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "kushd.fullname" . }}-controller
+      nodeSelector:
+        {{- toYaml .Values.controller.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.controller.tolerations | nindent 8 }}
+      containers:
+        - name: controller
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: UPS_DEVICE_PORT
+              value: {{ .Values.controller.upsDevice.port | quote }}
+            - name: ENABLE_KILLPOWER
+              value: {{ .Values.controller.powerManagement.enableKillpower | quote }}
+          volumeMounts:
+            - name: ups-dev
+              mountPath: {{ .Values.controller.upsDevice.port }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+      volumes:
+        - name: ups-dev
+          hostPath:
+            path: {{ .Values.controller.upsDevice.port }}
+            type: CharDevice
+
+```
+
+### 8.3 Agent DaemonSet (`charts/kushd/templates/daemonset-agent.yaml`)
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "kushd.fullname" . }}-agent
+  labels:
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: agent
+    spec:
+      hostPID: {{ .Values.agent.hostPID }}
+      priorityClassName: system-node-critical
+      tolerations:
+        {{- toYaml .Values.agent.tolerations | nindent 8 }}
+      containers:
+        - name: agent
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.agent.securityContext | nindent 12 }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: dbus-socket
+              mountPath: /host/run/dbus/system_bus_socket
+            - name: host-root
+              mountPath: /host
+          resources:
+            {{- toYaml .Values.agent.resources | nindent 12 }}
+      volumes:
+        - name: dbus-socket
+          hostPath:
+            path: {{ .Values.agent.dbusSocketPath }}
+            type: Socket
+        - name: host-root
+          hostPath:
+            path: {{ .Values.agent.hostRootPath }}
+            type: Directory
 
 ```
 
 ---
 
-## 9. CI/CD: GitHub Actions Publishing Pipeline
+## 9. CI/CD: Automated Publishing Workflows
 
-The delivery pipeline consists of two isolated, reproducible GitHub Actions workflows:
-
-1. **Container Image Pipeline:** Builds the Nix container layers and pushes multi-architecture images to GitHub Packages (GHCR).
-2. **Helm Release Pipeline:** Lints, templates, packages, and pushes the Helm chart as an **OCI artifact** directly to GHCR.
-
-### 9.1 Container Release Workflow (`.github/workflows/publish-containers.yaml`)
+### 9.1 Container Release (`.github/workflows/publish-containers.yaml`)
 
 ```yaml
-name: Publish Container Images
+name: Publish OCI Images
 
 on:
   push:
@@ -576,51 +674,48 @@ jobs:
 
     strategy:
       matrix:
-        component: [controller-image, agent-image, trigger-image]
         include:
-          - component: controller-image
+          - package-name: controller-image
             image-name: kushd-controller
-          - component: agent-image
+          - package-name: agent-image
             image-name: kushd-agent
-          - component: trigger-image
-            image-name: kushd-trigger
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Source
         uses: actions/checkout@v4
 
-      - name: Install Nix with Flake Support
+      - name: Install Nix
         uses: cachix/install-nix-action@v27
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Log into GitHub Container Registry
+      - name: Authenticate with GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Layered OCI Archive via Nix
+      - name: Build and Import Image via Nix
         run: |
-          nix build .#${{ matrix.component }}
+          nix build .#${{ matrix.package-name }}
           ./result | docker load
 
-      - name: Tag and Publish Image
+      - name: Publish Image Tags
         run: |
-          IMAGE_ID=ghcr.io/${{ github.repository_owner }}/${{ matrix.image-name }}
-          VERSION=${GITHUB_REF#refs/tags/}
-          
-          docker tag ${{ matrix.image-name }}:latest $IMAGE_ID:$VERSION
-          docker tag ${{ matrix.image-name }}:latest $IMAGE_ID:latest
-          
-          docker push $IMAGE_ID:$VERSION
-          docker push $IMAGE_ID:latest
+          IMAGE_URI="ghcr.io/${{ github.repository_owner }}/${{ matrix.image-name }}"
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:${TAG}
+          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:latest
+
+          docker push ${IMAGE_URI}:${TAG}
+          docker push ${IMAGE_URI}:latest
 
 ```
 
-### 9.2 Helm OCI Release Workflow (`.github/workflows/publish-helm.yaml`)
+### 9.2 Helm OCI Publishing (`.github/workflows/publish-helm.yaml`)
 
 ```yaml
 name: Publish Helm Chart (OCI)
@@ -631,49 +726,46 @@ on:
       - 'v*'
 
 jobs:
-  publish-chart:
+  publish-helm:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout Code
+      - name: Checkout Source
         uses: actions/checkout@v4
 
-      - name: Set up Helm
+      - name: Install Helm
         uses: azure/setup-helm@v4
         with:
           version: v3.14.0
 
-      - name: Lint Helm Chart
-        run: |
-          helm lint charts/kushd
+      - name: Validate Linting
+        run: helm lint charts/kushd
 
       - name: Package Chart
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          helm package charts/kushd --version $VERSION --app-version $VERSION -d .cr-release-packages
+          mkdir -p .cr-release
+          helm package charts/kushd --version ${VERSION} --app-version ${VERSION} -d .cr-release
 
-      - name: Log in to GHCR for OCI
+      - name: Authenticate Helm to GHCR
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Publish Chart to GHCR OCI Registry
+      - name: Push Chart OCI Artifact
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          helm push .cr-release-packages/kushd-${VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+          helm push .cr-release/kushd-${VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
 
 ```
 
 ---
 
-## 10. Reviewer Feedback & Iteration Matrix
+## 10. Reviewer Sign-Off Checklist
 
-| Section / Proposal | Focus Area | Reviewer Checklist & Verification |
-| --- | --- | --- |
-| **Topology Panic** | Hardware Safety | Does the fail-fast check execute before any discovery or network allocation occurs? |
-| **Killpower Optionality** | Rack Architecture | Are the defaults correctly established to prevent drops of shared network switches? |
-| **D-Bus vs chroot** | Node Host Security | Does the host path socket mount satisfy modern container security policies (SELinux / AppArmor)? |
-| **Nix Container Tooling** | Supply Chain Security | Do static binary outputs cleanly build within GitHub Actions execution budgets? |
-| **OCI Helm Registry** | Distribution Model | Are CRDs cleanly isolated in `crds/` to avoid helm lifecycle reconcile overwrites? |
+* [ ] **Anchor Identification:** Confirm that bare-metal provisioning automations label exactly one control plane node with `kushd.io/ups-anchor: "true"`.
+* [ ] **Storage Sync Baseline:** Verify that a 5-second `syscall.Sync()` boundary is sufficient for local NVMe/SATA write caches while avoiding network block hangs.
+* [ ] **PDB Forceful Deletion Window:** Confirm that allowing 75% of the total drain duration for polite eviction provides adequate windowing for internal databases (PostgreSQL/etcd) to checkpoint.
+* [ ] **Shared Outlet Isolation:** Confirm `enableKillpower` remains defaulted to `false` unless a dedicated, single-purpose rack is explicitly declared.
