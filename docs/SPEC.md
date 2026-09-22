@@ -1,109 +1,152 @@
 # Kushd (Kubernetes Shutdown Daemon) Engineering Specification
 
-**Document Version:** 1.0.0-RC2
+**Document Version:** 1.0.0-RC3
 
 **Status:** Ready for Review
 
 **Target Environments:** Bare-Metal & Edge Kubernetes (v1.28+)
 
-**Primary Subsystems:** Consolidated Controller (`kushd-controller`), Host Node Daemon (`kushd-agent`)
+**Primary Subsystems:** Consolidated Daemon Manager (`kushd-manager`), Host Node Daemon (`kushd-agent`)
 
 ---
 
 ## 1. Executive Summary & Core Invariants
 
-Kushd is a topology-aware, event-driven shutdown orchestrator for Kubernetes clusters operating behind Uninterruptible Power Supply (UPS) hardware. Abrupt power loss risks stateful corruption: `etcd` consensus split-brain, write-cache truncation on persistent volumes (Ceph, Longhorn, local block devices), and ungraceful pod termination.
+Kushd is a topology-aware, event-driven shutdown orchestrator for Kubernetes clusters operating behind Uninterruptible Power Supply (UPS) hardware. Abrupt power cuts induce stateful data loss: `etcd` quorum fragmentation, write-cache truncation on distributed block storage (Ceph, Longhorn, local persistent disks), and ungraceful pod termination.
 
-Kushd enforces an ordered, priority-aware decommission sequence down to the host OS level (`systemd`), while explicitly protecting shared rack infrastructure (networking, storage appliances) through an opt-in power-cut model.
+Kushd enforces an ordered, priority-aware decommission sequence down to the host OS layer (`systemd`), while protecting shared rack infrastructure (switches, routers, NAS appliances) through an opt-in power-cut model.
+
+Following Kubernetes operator patterns, Kushd consolidates cluster-wide reconciliation and raw hardware device I/O into a single higher-level process: **`kushd-manager`**.
 
 ```
-                      [UPS Hardware]
-                      (USB / Serial)
-                            │ (Mounted via /dev/ups0)
-                            ▼
-              ┌───────────────────────────┐
-              │ Control Plane Anchor Node │
-              │                           │
-              │     kushd-controller      │
-              │  (Poller + Reconciler)    │
-              └─────────────┬─────────────┘
-                            │
-               Phase 1: Worker Nodes (Parallel)
-                            │
-                            ▼
-                   ┌─────────────────┐
-                   │   kushd-agent   │
-                   │  (Worker Node)  │
-                   └────────┬────────┘
-                            ▼
-                   [systemd / D-Bus]
-                   [Host Poweroff  ]
-                            │
-               Phase 2: Control Plane (Sequential N-1)
-                            │
-                            ▼
-                   ┌─────────────────┐
-                   │   kushd-agent   │
-                   │  (CP Follower)  │
-                   └────────┬────────┘
-                            ▼
-                   [systemd / D-Bus]
-                   [Host Poweroff  ]
-                            │
-               Phase 3: Final Anchor Decommission
-                            │
-                            ▼
-                 [Optional UPS Killpower]
-                 [Anchor Host Poweroff  ]
+                         [UPS Hardware]
+                         (USB / Serial)
+                               │ (Mounted via /dev/kushd/ups0 directory)
+                               ▼
+                 ┌───────────────────────────┐
+                 │ Control Plane Anchor Node │
+                 │                           │
+                 │       kushd-manager       │
+                 │   (Poller + Reconciler)   │
+                 └─────────────┬─────────────┘
+                               │
+                  Phase 1: Worker Nodes (Parallel)
+                               │
+                               ▼
+                      ┌─────────────────┐
+                      │   kushd-agent   │
+                      │  (Worker Node)  │
+                      └────────┬────────┘
+                               ▼
+                      [systemd / D-Bus]
+                      [Host Poweroff  ]
+                               │
+                  Phase 2: Control Plane (Sequential N-1)
+                               │
+                               ▼
+                      ┌─────────────────┐
+                      │   kushd-agent   │
+                      │  (CP Follower)  │
+                      └────────┬────────┘
+                               ▼
+                      [systemd / D-Bus]
+                      [Host Poweroff  ]
+                               │
+                  Phase 3: Final Anchor Decommission
+                               │
+                               ▼
+                    [Optional UPS Killpower]
+                    [Anchor Host Poweroff  ]
 
 ```
 
 ### System Invariants
 
 1. **Topology Placement Invariant:** Physical UPS communication hardware (USB/Serial) **must** terminate on a control-plane node. Kushd enforces an in-process, clean exit (`os.Exit(1)`) without stack trace pollution if scheduled on a worker node.
-2. **Anchor-Node Architecture (No Leader Election):** `kushd-controller` runs as a single, pinned replica on the control-plane node hosting the UPS cable. Dynamic leader election is banned: standard Kubernetes Lease mechanisms deadlock as `etcd` members power down during cluster evacuation.
-3. **Unified Manager Process:** Hardware telemetry polling, cluster state reconciliation, and final hardware power cuts execute within a single container (`kushd-controller`), eliminating inter-process communication over failing networks or degrading `etcd` clusters.
-4. **Point-of-No-Return:** Once worker node evacuation begins, abort sequences are rejected. The cluster must reach full poweroff to prevent partitioned states across partially dismantled cluster topologies.
-5. **Configurable Power Cut (`killpower`):** Kushd defaults to `enableKillpower: false` to allow auxiliary rack infrastructure (switches, routers, NAS) to continue running on battery reserves. Cutting physical UPS load power is treated as an explicit, opt-in administrative setting.
+2. **Anchor-Node Architecture (No Leader Election):** `kushd-manager` runs as a single, pinned replica on the control-plane node hosting the physical UPS cable. Dynamic leader election is banned: standard Kubernetes Lease mechanisms deadlock as `etcd` members power down during cluster evacuation.
+3. **Consolidated Manager Process:** Hardware telemetry polling, cluster state reconciliation, and final hardware power cuts execute within a single container (`kushd-manager`), eliminating inter-process communication over failing networks or degrading `etcd` clusters.
+4. **Point-of-No-Return:** Once worker node evacuation begins, abort sequences are rejected. The cluster must reach full poweroff to prevent split-brain workloads across partially dismantled cluster topologies.
+5. **Configurable Power Cut (`killpower`):** Kushd defaults to `enableKillpower: false` to allow auxiliary rack infrastructure (switches, routers, storage) to continue running on battery reserves. Cutting physical UPS load power is treated as an explicit, opt-in administrative setting.
 
 ---
 
 ## 2. Component Architecture
 
-### 2.1 `kushd-controller` (Single-Replica Manager)
+### 2.1 `kushd-manager` (Unified Manager Process)
 
-Deployed as a single-pod `Deployment` pinned to the physical UPS host via `nodeSelector`. It runs two concurrent loops within a single Go binary:
+Deployed as a single-pod `Deployment` pinned to the physical UPS host via `nodeSelector`. It runs two concurrent loops within a single Go process:
 
-* **Hardware Poller Routine:** Continually polls battery metrics over a persistent device path (`/dev/ups0`) via NUT or direct USB HID. Detects power transitions (`ONBATT`, `LOWBATT`) and creates or reconciles the `ClusterShutdown` Custom Resource.
-* **Cluster Reconciler Routine:** Watches `ClusterShutdown` resources, manages the phase state machine, cordons nodes, dispatches stage annotations to `kushd-agent` instances, monitors node health, and executes final anchor host poweroff.
+* **Hardware Poller Loop:** Polls battery metrics over a persistent device directory (`/dev/kushd/ups0`) via NUT or direct USB HID. Detects power transitions (`ONBATT`, `LOWBATT`), tracks runtime trends, dynamically re-evaluates device symlinks to survive USB bus resets, and creates/updates the `ClusterShutdown` Custom Resource.
+* **Cluster Reconciler Loop:** Watches `ClusterShutdown` resources, drives the shutdown state machine, cordons nodes, writes execution parameters to `kushd-agent` annotations, tracks node evictions, handles abort validation, and executes final anchor host poweroff.
 
 ### 2.2 `kushd-agent` (Privileged DaemonSet)
 
 Runs as a privileged DaemonSet on all nodes. Mounts the host D-Bus system socket and host root filesystem. It:
 
-* Watches its local `Node` object annotations (`kushd.io/stage`).
-* Executes local pod evictions, automatically escalating to forceful deletion if PodDisruptionBudgets (PDBs) block shutdown progress.
+* Watches local `Node` object annotations for execution directives (`kushd.io/stage`) and parameters (`kushd.io/drain-timeout`).
+* Executes local pod evictions, automatically escalating to forceful deletion (`gracePeriodSeconds: 0`) at the 75% mark of the assigned timeout if PodDisruptionBudgets (PDBs) block shutdown progress.
 * Flushes dirty filesystem buffers via a timeout-bounded synchronization wrapper.
-* Issues `org.freedesktop.systemd1.Manager.PowerOff` to the host systemd daemon.
+* Issues `org.freedesktop.systemd1.Manager.PowerOff` to the host systemd daemon over D-Bus.
 
 ---
 
-## 3. Hardware & Startup Validation
+## 3. Hardware Interfacing & Hot-Plug Inode Invalidation
 
-### 3.1 Persistent Device Symlinking
+### 3.1 USB Hot-Plugging & Stale Inode Prevention
 
-To survive Linux USB re-enumeration (e.g., `/dev/ttyUSB0` changing to `/dev/ttyUSB1` after transient brownouts), the host must expose a predictable udev path.
+When a USB device disconnects or experiences a transient bus reset, the Linux kernel assigns the reconnected device a new character device node (e.g., `/dev/ttyUSB1` replacing `/dev/ttyUSB0`) with a **new inode number**.
+
+If Kubernetes mounts a specific device path directly into a container (`type: CharDevice`), the container runtime pins the mount to the original device inode. When the device resets, the mount retains the dead inode, severing container communication indefinitely.
+
+To guarantee zero-restart recovery during USB re-enumeration:
+
+1. The host udev rule creates a symlink inside an isolated directory (`/dev/kushd/ups0`).
+2. Helm mounts the **directory** (`/dev/kushd`) with `type: Directory` instead of binding a specific character device.
+3. `kushd-manager` dynamically evaluates the symlink on every polling cycle via `filepath.EvalSymlinks`.
 
 **Host udev Rule (`/etc/udev/rules.d/99-ups.rules`):**
 
 ```udev
-SUBSYSTEM=="usb", ATTRS{idVendor}=="051d", ATTRS{idProduct}=="0002", SYMLINK+="ups0", MODE="0660", GROUP="dialout"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="051d", ATTRS{idProduct}=="0002", ACTION=="add", RUN+="/bin/mkdir -p /dev/kushd", SYMLINK+="kushd/ups0", MODE="0660", GROUP="dialout"
 
 ```
 
-### 3.2 Startup Topology Guard
+### 3.2 Dynamic Symlink Resolution Logic
 
-On initialization, `kushd-controller` validates that its hosting node carries the control-plane role. Violations log structured JSON errors and terminate cleanly with exit code 1 to induce a clean `CrashLoopBackOff` without Go runtime stack dump noise.
+```go
+package hardware
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+// ResolveDevicePath guarantees access to active device inodes across USB bus blips
+func ResolveDevicePath(symlinkPath string) (string, error) {
+	realPath, err := filepath.EvalSymlinks(symlinkPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve UPS device symlink %s: %w", symlinkPath, err)
+	}
+
+	info, err := os.Stat(realPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to stat resolved device %s: %w", realPath, err)
+	}
+
+	// Verify target is a character device
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return "", fmt.Errorf("target device %s is not a character device", realPath)
+	}
+
+	return realPath, nil
+}
+
+```
+
+### 3.3 Startup Topology Guard
+
+On initialization, `kushd-manager` verifies that its hosting node carries the control-plane role. Violations log structured JSON errors and terminate cleanly with exit code 1 to induce a clean `CrashLoopBackOff` without Go runtime stack dump noise.
 
 ```go
 package main
@@ -197,7 +240,8 @@ spec:
                       description: "Instructs the UPS to cut load power after node halts."
                     killpowerDelaySeconds:
                       type: integer
-                      default: 60
+                      default: 180
+                      description: "Must exceed systemd DefaultTimeoutStopSec (90s) plus sync timeouts."
                     targetOutletGroup:
                       type: string
                       default: ""
@@ -255,12 +299,15 @@ spec:
 
 ```
 
-### 4.2 Node Annotation Interface
+### 4.2 Expanded Node Annotation Interface
+
+The interface decouples policy from node runtime mechanics, passing both the stage directive and the computed execution parameters directly to the node agent:
 
 | Annotation Key | Values | Direction | Operational Meaning |
 | --- | --- | --- | --- |
-| `kushd.io/stage` | `idle`, `drain`, `halt` | Controller $\to$ Agent | Target lifecycle state command. |
-| `kushd.io/agent-status` | `ready`, `draining`, `drained`, `halting`, `failed` | Agent $\to$ Controller | Reported execution state of the node host. |
+| `kushd.io/stage` | `idle`, `drain`, `halt` | Manager $\to$ Agent | Target lifecycle state command. |
+| `kushd.io/drain-timeout` | Duration string (e.g., `120s`) | Manager $\to$ Agent | Evacuation window used by agent to schedule polite vs. forceful eviction. |
+| `kushd.io/agent-status` | `ready`, `draining`, `drained`, `halting`, `failed` | Agent $\to$ Manager | Reported execution state of the host. |
 
 ---
 
@@ -313,36 +360,122 @@ Mains Restored(OL) │              ▼              │ Mains Restored (OL)
 
 ```
 
-### 5.1 Phase Transitions
+### 5.1 Abort Rejection Handling
 
-| Phase | Entry Condition | Action Taken | Next Phase |
-| --- | --- | --- | --- |
-| **Pending** | CR Created / Battery Critical | Validate anchor node locks and read configuration. | `CordoningCluster` |
-| **CordoningCluster** | Phase == Pending | Set `spec.unschedulable: true` on **all** cluster nodes. | `DrainingWorkers` |
-| **DrainingWorkers** | Phase == CordoningCluster | Set `kushd.io/stage: drain` on all worker nodes. Point-of-No-Return crossed. | `HaltingWorkers` |
-| **HaltingWorkers** | Workers report `drained` OR `workerEvacuationSeconds` expires | Set `kushd.io/stage: halt` on worker nodes. Controller waits for workers to report `NotReady` or disconnect. | `DrainingControlPlane` |
-| **DrainingControlPlane** | All worker nodes offline | Set `kushd.io/stage: drain` on non-anchor control-plane nodes sequentially. | `HaltingControlPlane` |
-| **HaltingControlPlane** | Followers drained | Set `kushd.io/stage: halt` on non-anchor control-plane nodes. | `Finalizing` |
-| **Finalizing** | Followers offline | Anchor agent syncs storage. If `enableKillpower: true`, controller schedules hardware cut. | `Completed` |
-| **Completed** | Finalizing complete | Anchor host calls D-Bus `PowerOff()`. Terminal state. | — |
-| **Aborted** | Power restored or `spec.abort: true` before Point-of-No-Return | Remove cordon (`spec.unschedulable: false`) across all nodes. Remove stage annotations. | Terminal |
+If an administrator applies `spec.abort: true` (or the UPS transitions back to `OL`) **after** the cluster has entered `DrainingWorkers` or subsequent phases:
 
-### 5.2 Two-Stage Evacuation & PDB Escalation
+1. **Rejection Interlock:** The manager refuses to revert the phase.
+2. **Condition Recording:** The manager updates `status.conditions` on the `ClusterShutdown` resource:
+* `type: "AbortRejected"`
+* `status: "True"`
+* `reason: "PointOfNoReturnExceeded"`
+* `message: "Manual abort rejected: cluster has passed the point-of-no-return (workers are draining/halting). Full shutdown must proceed."`
 
-Standard eviction calls can block indefinitely on strict PodDisruptionBudgets (PDBs) or stateful storage daemons (e.g., Ceph OSDs, Longhorn replicas). `kushd-agent` implements a dual-stage eviction loop:
 
-1. **Polite Eviction (0% to 75% of `workerEvacuationSeconds`):**
-Issues Kubernetes Eviction requests (`/api/v1/namespaces/{ns}/pods/{name}/eviction`). Respects PDB constraints and honors individual workload `terminationGracePeriodSeconds`.
-2. **Forceful Evacuation (75% to 100% of `workerEvacuationSeconds`):**
-If pods remain on the node, the agent escalates to direct pod deletion (`DELETE /api/v1/namespaces/{ns}/pods/{name}`) with `gracePeriodSeconds: 0`. This overrides failing storage pods and broken disruption budgets to ensure the host can decommission before battery failure.
+3. **Event Generation:** The manager emits a cluster-level Warning event:
+```
+Warning  AbortRejected  clustershutdown/ups-event  Manual abort rejected: cluster has passed the point-of-no-return. Evacuation pipeline continuing to completion.
+
+```
+
+
+4. **Execution Continuity:** The reconciler proceeds without interruption to `HaltingWorkers`.
+
+### 5.2 Agent-Side PDB Escalation
+
+When `kushd-agent` detects `kushd.io/stage: drain`, it reads the timeout duration from `kushd.io/drain-timeout` (falling back to a safe default of `90s` if unassigned). It derives two internal phases:
+
+```go
+package drain
+
+import (
+	"context"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+)
+
+func ExecuteEscalatingDrain(ctx context.Context, client kubernetes.Interface, nodeName string, timeout time.Duration) error {
+	politeDeadline := time.Now().Add(time.Duration(float64(timeout) * 0.75))
+	hardDeadline := time.Now().Add(timeout)
+
+	// Phase 1: Polite Eviction (75% of window)
+	// Honors PodDisruptionBudgets and graceful termination periods
+	for time.Now().Before(politeDeadline) {
+		remainingPods := getNonDaemonSetPods(ctx, client, nodeName)
+		if len(remainingPods) == 0 {
+			return nil
+		}
+		for _, pod := range remainingPods {
+			_ = client.CoreV1().Pods(pod.Namespace).EvictV1(ctx, &evictionPayload(pod))
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	// Phase 2: Forceful Deletion Escalation (Final 25% of window)
+	// Overrides failing PDBs, hung finalizers, and unresponsive storage mounts
+	forceContext, cancel := context.WithDeadline(ctx, hardDeadline)
+	defer cancel()
+
+	remainingPods := getNonDaemonSetPods(forceContext, client, nodeName)
+	for _, pod := range remainingPods {
+		gracePeriodZero := int64(0)
+		_ = client.CoreV1().Pods(pod.Namespace).Delete(forceContext, pod.Name, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriodZero,
+		})
+	}
+
+	return nil
+}
+
+```
 
 ---
 
-## 6. Host Integration & Agent Mechanics
+## 6. Kernel Deadlocks & Host Power Execution
 
-### 6.1 Non-Blocking Host Buffer Synchronization
+### 6.1 Bounded Storage Sync vs. Kernel Unmount Deadlocks
 
-Synchronous `syscall.Sync()` invocations can deadlock indefinitely if network-attached filesystems (NFS, Ceph, iSCSI) become unresponsive due to network switches dropping power. `kushd-agent` isolates filesystem synchronization inside a bounded goroutine with a 5-second deadline.
+While `kushd-agent` bounds its `syscall.Sync()` call to a 5-second context timeout, calling `PowerOff()` transfers execution to `systemd`.
+
+During OS shutdown, `systemd` iterates over all active mounts and issues `umount`. If a network-attached filesystem (NFS, Ceph, iSCSI) is hung due to power loss on an upstream switch, the Linux kernel holds locks on the virtual filesystem (VFS) superblock. `systemd` halts on this unmount job until it hits its internal stop-job timeout (`DefaultTimeoutStopSec=90s`).
+
+```
+kushd-agent                     systemd                             Linux Kernel
+    │                              │                                      │
+    ├── 5s Sync Timeout ──────────►│                                      │
+    │   (Advances without hang)    │                                      │
+    │                              │                                      │
+    └── D-Bus: PowerOff() ────────►│                                      │
+                                   ├── SIGTERM / SIGKILL to Units ───────►│
+                                   │                                      │
+                                   └── Umount Network Filesystems ───────►│
+                                       (Kernel blocks on dead storage)    │
+                                       │                                  │
+                                       ├── [HANGS FOR 90 SECONDS] ────────┤
+                                       │   (DefaultTimeoutStopSec)        │
+                                       │                                  │
+                                       └── Forceful Lazy Unmount / Kill ─►│
+                                           │                              │
+                                           └── ACPI PowerOff ────────────►│ (HALT)
+
+```
+
+### 6.2 Sizing `killpowerDelaySeconds`
+
+If `enableKillpower: true` is set, the UPS hardware timer begins counting down the moment `kushd-manager` issues the shutdown instruction.
+
+If `killpowerDelaySeconds` is smaller than the systemd stop-job timeout, the UPS will cut power **while the final anchor node is still hanging on storage unmounts**, resulting in filesystem truncation and dirty metadata state.
+
+**Mandatory Baseline:**
+
+`killpowerDelaySeconds` must be configured to at least **180 seconds**:
+
+
+$$\text{killpowerDelaySeconds} \ge \text{DefaultTimeoutStopSec (90s)} + \text{Bounded Sync (5s)} + \text{Firmware/ACPI Flush Window (85s)}$$
+
+### 6.3 Host Power Execution Loop
 
 ```go
 package main
@@ -372,7 +505,7 @@ func NewHostPowerController() (*HostPowerController, error) {
 func (h *HostPowerController) HaltHost(ctx context.Context) error {
 	slog.Info("Initiating host storage buffer sync...")
 
-	// Execute storage sync with a strict 5-second deadline to prevent network hangs
+	// 5-second deadline ensures hung network mounts do not block the agent process
 	syncDone := make(chan struct{})
 	go func() {
 		syscall.Sync()
@@ -383,13 +516,12 @@ func (h *HostPowerController) HaltHost(ctx context.Context) error {
 	case <-syncDone:
 		slog.Info("Storage buffers successfully synced to disk")
 	case <-time.After(5 * time.Second):
-		slog.Warn("Storage sync timed out after 5s; proceeding with halt to prevent power depletion")
+		slog.Warn("Storage sync timed out after 5s; advancing to systemd poweroff to prevent power depletion")
 	}
 
 	slog.Info("Invoking systemd PowerOff via D-Bus...")
 	systemd := h.conn.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
 	
-	// 'replace' job mode cancels pending unit transactions and triggers instant poweroff
 	call := systemd.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.PowerOff", 0)
 	if call.Err != nil {
 		return fmt.Errorf("systemd D-Bus invocation failed: %w", call.Err)
@@ -400,23 +532,14 @@ func (h *HostPowerController) HaltHost(ctx context.Context) error {
 
 ```
 
-### 6.2 Secondary Execution Fallback
-
-If the D-Bus socket is unresponsive, the agent falls back to direct chroot execution:
-
-```bash
-chroot /host /usr/bin/systemctl poweroff --force --force
-
-```
-
 ---
 
 ## 7. Packaging: Minimal Nix Container Images
 
 Container images are compiled with **Nix flakes** using `dockerTools.buildLayeredImage`.
 
-* `kushd-controller` includes static binaries, IANA TLS certificates, and NUT libraries for hardware communication.
-* `kushd-agent` is strictly lean; redundant `systemd` packages are omitted since fallback routines execute via `chroot` against the host's `/usr/bin/systemctl`.
+* `kushd-manager` contains static Go binaries, IANA TLS certificates, and NUT libraries for hardware communication.
+* `kushd-agent` contains strictly static Go binaries and runtime certificates. `systemd` packages are omitted because fallback execution calls `chroot /host /usr/bin/systemctl`.
 
 ### `flake.nix`
 
@@ -436,7 +559,7 @@ Container images are compiled with **Nix flakes** using `dockerTools.buildLayere
 
         buildKushdBin = name: pkgs.buildGoModule {
           pname = name;
-          version = "1.2.0";
+          version = "1.3.0";
           src = ./.;
           subPackages = [ "cmd/${name}" ];
           vendorHash = null;
@@ -444,7 +567,7 @@ Container images are compiled with **Nix flakes** using `dockerTools.buildLayere
           ldflags = [ "-s" "-w" "-extldflags '-static'" ];
         };
 
-        kushdController = buildKushdBin "kushd-controller";
+        kushdManager = buildKushdBin "kushd-manager";
         kushdAgent = buildKushdBin "kushd-agent";
 
         buildKushdImage = { name, package, extraContents ? [] }:
@@ -463,9 +586,9 @@ Container images are compiled with **Nix flakes** using `dockerTools.buildLayere
 
       in {
         packages = {
-          controller-image = buildKushdImage {
-            name = "kushd-controller";
-            package = kushdController;
+          manager-image = buildKushdImage {
+            name = "kushd-manager";
+            package = kushdManager;
             extraContents = [ pkgs.nut ];
           };
           agent-image = buildKushdImage {
@@ -483,25 +606,44 @@ Container images are compiled with **Nix flakes** using `dockerTools.buildLayere
 
 ## 8. Deployment: Helm Chart Specification
 
-### 8.1 Values Manifest (`charts/kushd/values.yaml`)
+### 8.1 Chart Structure
+
+```
+charts/kushd/
+├── Chart.yaml
+├── values.yaml
+├── crds/
+│   └── clustershutdowns.kushd.io.yaml
+└── templates/
+    ├── _helpers.tpl
+    ├── rbac-manager.yaml
+    ├── rbac-agent.yaml
+    ├── deployment-manager.yaml
+    └── daemonset-agent.yaml
+
+```
+
+### 8.2 Values Manifest (`charts/kushd/values.yaml`)
 
 ```yaml
 global:
   imageRegistry: ghcr.io/kushd
   imagePullPolicy: IfNotPresent
 
-controller:
-  # Strictly single replica pinned to the physical UPS anchor host
+manager:
   replicaCount: 1
   image:
-    repository: kushd-controller
-    tag: v1.2.0
+    repository: kushd-manager
+    tag: v1.3.0
   upsDevice:
-    port: "/dev/ups0"
+    # Directory mount to avoid stale inode pinning across USB disconnects
+    deviceDir: "/dev/kushd"
+    symlinkName: "ups0"
     driver: "usbhid-ups"
   powerManagement:
     enableKillpower: false
-    killpowerDelaySeconds: 60
+    # Accommodates 90s systemd unmount stop-job timeout + buffer sync margin
+    killpowerDelaySeconds: 180
     targetOutletGroup: ""
   thresholds:
     batteryLowPercent: 20
@@ -527,7 +669,7 @@ controller:
 agent:
   image:
     repository: kushd-agent
-    tag: v1.2.0
+    tag: v1.3.0
   hostPID: true
   securityContext:
     privileged: true
@@ -545,35 +687,35 @@ agent:
 
 ```
 
-### 8.2 Controller Deployment (`charts/kushd/templates/deployment-controller.yaml`)
+### 8.3 Manager Deployment (`charts/kushd/templates/deployment-manager.yaml`)
 
 ```yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "kushd.fullname" . }}-controller
+  name: {{ include "kushd.fullname" . }}-manager
   labels:
-    app.kubernetes.io/component: controller
+    app.kubernetes.io/component: manager
 spec:
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/component: controller
+      app.kubernetes.io/component: manager
   template:
     metadata:
       labels:
-        app.kubernetes.io/component: controller
+        app.kubernetes.io/component: manager
     spec:
-      serviceAccountName: {{ include "kushd.fullname" . }}-controller
+      serviceAccountName: {{ include "kushd.fullname" . }}-manager
       nodeSelector:
-        {{- toYaml .Values.controller.nodeSelector | nindent 8 }}
+        {{- toYaml .Values.manager.nodeSelector | nindent 8 }}
       tolerations:
-        {{- toYaml .Values.controller.tolerations | nindent 8 }}
+        {{- toYaml .Values.manager.tolerations | nindent 8 }}
       containers:
-        - name: controller
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+        - name: manager
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             privileged: true
@@ -582,71 +724,24 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: UPS_DEVICE_PORT
-              value: {{ .Values.controller.upsDevice.port | quote }}
+            - name: UPS_DEVICE_DIR
+              value: {{ .Values.manager.upsDevice.deviceDir | quote }}
+            - name: UPS_SYMLINK_NAME
+              value: {{ .Values.manager.upsDevice.symlinkName | quote }}
             - name: ENABLE_KILLPOWER
-              value: {{ .Values.controller.powerManagement.enableKillpower | quote }}
+              value: {{ .Values.manager.powerManagement.enableKillpower | quote }}
+            - name: KILLPOWER_DELAY_SECONDS
+              value: {{ .Values.manager.powerManagement.killpowerDelaySeconds | quote }}
           volumeMounts:
-            - name: ups-dev
-              mountPath: {{ .Values.controller.upsDevice.port }}
+            # Mount parent directory to survive device inode changes across USB reconnects
+            - name: ups-dev-dir
+              mountPath: {{ .Values.manager.upsDevice.deviceDir }}
           resources:
-            {{- toYaml .Values.controller.resources | nindent 12 }}
+            {{- toYaml .Values.manager.resources | nindent 12 }}
       volumes:
-        - name: ups-dev
+        - name: ups-dev-dir
           hostPath:
-            path: {{ .Values.controller.upsDevice.port }}
-            type: CharDevice
-
-```
-
-### 8.3 Agent DaemonSet (`charts/kushd/templates/daemonset-agent.yaml`)
-
-```yaml
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: {{ include "kushd.fullname" . }}-agent
-  labels:
-    app.kubernetes.io/component: agent
-spec:
-  selector:
-    matchLabels:
-      app.kubernetes.io/component: agent
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/component: agent
-    spec:
-      hostPID: {{ .Values.agent.hostPID }}
-      priorityClassName: system-node-critical
-      tolerations:
-        {{- toYaml .Values.agent.tolerations | nindent 8 }}
-      containers:
-        - name: agent
-          image: "{{ .Values.global.imageRegistry }}/{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
-          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
-          securityContext:
-            {{- toYaml .Values.agent.securityContext | nindent 12 }}
-          env:
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-          volumeMounts:
-            - name: dbus-socket
-              mountPath: /host/run/dbus/system_bus_socket
-            - name: host-root
-              mountPath: /host
-          resources:
-            {{- toYaml .Values.agent.resources | nindent 12 }}
-      volumes:
-        - name: dbus-socket
-          hostPath:
-            path: {{ .Values.agent.dbusSocketPath }}
-            type: Socket
-        - name: host-root
-          hostPath:
-            path: {{ .Values.agent.hostRootPath }}
+            path: {{ .Values.manager.upsDevice.deviceDir }}
             type: Directory
 
 ```
@@ -655,7 +750,7 @@ spec:
 
 ## 9. CI/CD: Automated Publishing Workflows
 
-### 9.1 Container Release (`.github/workflows/publish-containers.yaml`)
+### 9.1 Container Release Pipeline (`.github/workflows/publish-containers.yaml`)
 
 ```yaml
 name: Publish OCI Images
@@ -675,8 +770,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - package-name: controller-image
-            image-name: kushd-controller
+          - package-name: manager-image
+            image-name: kushd-manager
           - package-name: agent-image
             image-name: kushd-agent
 
@@ -715,7 +810,7 @@ jobs:
 
 ```
 
-### 9.2 Helm OCI Publishing (`.github/workflows/publish-helm.yaml`)
+### 9.2 Helm OCI Publishing Pipeline (`.github/workflows/publish-helm.yaml`)
 
 ```yaml
 name: Publish Helm Chart (OCI)
@@ -765,7 +860,8 @@ jobs:
 
 ## 10. Reviewer Sign-Off Checklist
 
-* [ ] **Anchor Identification:** Confirm that bare-metal provisioning automations label exactly one control plane node with `kushd.io/ups-anchor: "true"`.
-* [ ] **Storage Sync Baseline:** Verify that a 5-second `syscall.Sync()` boundary is sufficient for local NVMe/SATA write caches while avoiding network block hangs.
-* [ ] **PDB Forceful Deletion Window:** Confirm that allowing 75% of the total drain duration for polite eviction provides adequate windowing for internal databases (PostgreSQL/etcd) to checkpoint.
-* [ ] **Shared Outlet Isolation:** Confirm `enableKillpower` remains defaulted to `false` unless a dedicated, single-purpose rack is explicitly declared.
+* [ ] **Manager Nomenclature:** Confirm that all code references, build artifacts, container packages, and Helm manifests reference `kushd-manager`.
+* [ ] **Device Directory Mount:** Confirm that the host udev rule creates `/dev/kushd/ups0` and that the Helm chart mounts the directory rather than the leaf character device.
+* [ ] **Timeout Annotation Propagation:** Verify that `kushd-manager` sets `kushd.io/drain-timeout` alongside `kushd.io/stage: drain`, and that `kushd-agent` calculates the 75% escalation threshold based on this value.
+* [ ] **Abort Rejection Condition:** Confirm that late abort requests write an `AbortRejected` status condition and emit a Warning event rather than aborting an active worker eviction.
+* [ ] **Killpower Delay Sizing:** Confirm that `killpowerDelaySeconds` defaults to $\ge 180$ seconds to survive systemd's 90-second unmount timeout on unresponsive network storage.
