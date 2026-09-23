@@ -40,7 +40,7 @@ jobs:
       - name: Build and Import Image via Nix
         run: |
           nix build .#${{ matrix.package-name }}
-          ./result | docker load
+          docker load < ./result
 
       - name: Publish Image Tags
         run: |
