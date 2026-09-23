@@ -13,11 +13,10 @@
 
         buildKushdBin = name: pkgs.buildGoModule {
           pname = name;
-          version = "1.0.1";
+          version = "1.0.2";
           src = ./.;
           subPackages = [ "cmd/${name}" ];
           vendorHash = null;
-          CGO_ENABLED = 0;
           ldflags = [ "-s" "-w" "-extldflags '-static'" ];
         };
 
