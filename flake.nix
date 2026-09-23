@@ -13,7 +13,7 @@
 
         buildKushdBin = name: pkgs.buildGoModule {
           pname = name;
-          version = "1.4.0";
+          version = "1.0.0";
           src = ./.;
           subPackages = [ "cmd/${name}" ];
           vendorHash = null;
@@ -28,13 +28,9 @@
           pkgs.dockerTools.buildLayeredImage {
             inherit name;
             tag = "latest";
-            contents = [
-              pkgs.cacert
-              pkgs.tzdata
-            ] ++ extraContents;
+            contents = extraContents;
             config = {
               Entrypoint = [ "${package}/bin/${name}" ];
-              Env = [ "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt" ];
             };
           };
 
