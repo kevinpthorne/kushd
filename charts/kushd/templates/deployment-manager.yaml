@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kushd.fullname" . }}-manager
+  labels:
+    app.kubernetes.io/component: manager
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: manager
+    spec:
+      serviceAccountName: {{ include "kushd.fullname" . }}-manager
+      nodeSelector:
+        {{- toYaml .Values.manager.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.manager.tolerations | nindent 8 }}
+      containers:
+        - name: manager
+          image: "{{ .Values.global.imageRegistry }}/{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag }}"
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ENABLE_KILLPOWER
+              value: {{ .Values.manager.powerManagement.enableKillpower | quote }}
+            - name: KILLPOWER_DELAY_SECONDS
+              value: {{ .Values.manager.powerManagement.killpowerDelaySeconds | quote }}
+          resources:
+            limits:
+              cpu: {{ .Values.manager.resources.limits.cpu }}
+              memory: {{ .Values.manager.resources.limits.memory }}
+              {{ .Values.manager.akriResource }}: 1
+            requests:
+              cpu: {{ .Values.manager.resources.requests.cpu }}
+              memory: {{ .Values.manager.resources.requests.memory }}
+              {{ .Values.manager.akriResource }}: 1

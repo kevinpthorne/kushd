@@ -1,0 +1,54 @@
+name: Publish OCI Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        include:
+          - package-name: manager-image
+            image-name: kushd-manager
+          - package-name: agent-image
+            image-name: kushd-agent
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Authenticate with GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Import Image via Nix
+        run: |
+          nix build .#${{ matrix.package-name }}
+          ./result | docker load
+
+      - name: Publish Image Tags
+        run: |
+          IMAGE_URI="ghcr.io/${{ github.repository_owner }}/${{ matrix.image-name }}"
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:${TAG}
+          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:latest
+
+          docker push ${IMAGE_URI}:${TAG}
+          docker push ${IMAGE_URI}:latest

@@ -1,0 +1,107 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clustershutdowns.kushd.io
+spec:
+  group: kushd.io
+  names:
+    kind: ClusterShutdown
+    listKind: ClusterShutdownList
+    plural: clustershutdowns
+    singular: clustershutdown
+    shortNames: ["csd"]
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["triggerSource", "batteryChargePercent", "estimatedRuntimeSeconds"]
+              properties:
+                triggerSource:
+                  type: string
+                  example: "UPS-BackUPS-1500"
+                batteryChargePercent:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+                estimatedRuntimeSeconds:
+                  type: integer
+                abort:
+                  type: boolean
+                  default: false
+                  description: "Manual override to cancel shutdown if set before Point-of-No-Return."
+                dryRun:
+                  type: boolean
+                  default: false
+                powerManagement:
+                  type: object
+                  properties:
+                    enableKillpower:
+                      type: boolean
+                      default: false
+                      description: "Instructs the UPS to cut load power after node halts."
+                    killpowerDelaySeconds:
+                      type: integer
+                      default: 180
+                      description: "Must exceed systemd DefaultTimeoutStopSec (90s) plus sync timeouts."
+                    targetOutletGroup:
+                      type: string
+                      default: ""
+                timeouts:
+                  type: object
+                  properties:
+                    workerEvacuationSeconds:
+                      type: integer
+                      default: 120
+                    controlPlaneEvacuationSeconds:
+                      type: integer
+                      default: 60
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum:
+                    - Pending
+                    - CordoningCluster
+                    - DrainingWorkers
+                    - HaltingWorkers
+                    - DrainingControlPlane
+                    - HaltingControlPlane
+                    - Finalizing
+                    - Completed
+                    - Aborted
+                    - Failed
+                observedGeneration:
+                  type: integer
+                startTime:
+                  type: string
+                  format: date-time
+                completionTime:
+                  type: string
+                  format: date-time
+                anchorNode:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string

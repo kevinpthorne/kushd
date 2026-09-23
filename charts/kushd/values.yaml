@@ -1,0 +1,59 @@
+global:
+  imageRegistry: ghcr.io/kushd
+  imagePullPolicy: IfNotPresent
+
+manager:
+  replicaCount: 1
+  image:
+    repository: kushd-manager
+    tag: v1.4.0
+  # Akri extended resource advertised by akri-udev-ups Configuration
+  akriResource: "akri.sh/ups"
+  powerManagement:
+    enableKillpower: false
+    # Must exceed 90s systemd stop-job timeout + buffer sync margin
+    killpowerDelaySeconds: 180
+    targetOutletGroup: ""
+  thresholds:
+    batteryLowPercent: 20
+    runtimeLowSeconds: 300
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+      akri.sh/ups: 1
+    requests:
+      cpu: 20m
+      memory: 64Mi
+      akri.sh/ups: 1
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: ""
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node.kubernetes.io/unschedulable"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+agent:
+  image:
+    repository: kushd-agent
+    tag: v1.4.0
+  hostPID: true
+  securityContext:
+    privileged: true
+    seLinuxOptions:
+      type: "spc_t"
+  hostRootPath: /
+  dbusSocketPath: /run/dbus/system_bus_socket
+  sysrqTriggerPath: /proc/sysrq-trigger
+  tolerations:
+    - operator: "Exists"
+  resources:
+    limits:
+      cpu: 50m
+      memory: 64Mi
+    requests:
+      cpu: 10m
+      memory: 32Mi

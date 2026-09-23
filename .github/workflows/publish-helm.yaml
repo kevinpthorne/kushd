@@ -1,0 +1,40 @@
+name: Publish Helm Chart (OCI)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-helm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Validate Linting
+        run: helm lint charts/kushd
+
+      - name: Package Chart
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          mkdir -p .cr-release
+          helm package charts/kushd --version ${VERSION} --app-version ${VERSION} -d .cr-release
+
+      - name: Authenticate Helm to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push Chart OCI Artifact
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          helm push .cr-release/kushd-${VERSION}.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
