@@ -80,7 +80,7 @@ Abrupt power failure introduces severe data corruption risks: `etcd` split-brain
 ## Core Invariants
 
 1. **Topology Placement Invariant**: Physical UPS communication hardware must terminate on a control-plane node. `kushd-manager` validates this on startup and exits cleanly (`os.Exit(1)`) without stack traces if scheduled on a worker node.
-2. **Akri-Driven Implicit Anchor Scheduling**: `kushd-manager` requests `akri.sh/ups: 1` alongside a control-plane `nodeSelector`. Kubernetes pins the manager to the node with the UPS without manual node labeling.
+2. **Akri-Driven Implicit Anchor Scheduling**: `kushd-manager` requests `akri.sh/ups: 1` alongside control-plane `nodeAffinity`. Kubernetes pins the manager to the node with the UPS without manual node labeling.
 3. **Point-of-No-Return**: Once worker node evacuation begins, abort requests (whether manual `spec.abort: true` or mains power restoration) are rejected with an `AbortRejected` status condition and Kubernetes Warning event to prevent partitioned cluster states.
 4. **Configurable Power Cut (`killpower`)**: `enableKillpower` defaults to `false` to preserve battery reserves for auxiliary rack equipment. When enabled, `killpowerDelaySeconds` is safely clamped to $\ge 180$ seconds to account for `systemd` stop jobs on hung network mounts.
 5. **Strict TLS Enforcement**: Kubernetes API access strictly verifies TLS certificates at all times; insecure verification is forbidden.

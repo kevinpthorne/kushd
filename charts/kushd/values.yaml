@@ -1,12 +1,12 @@
 global:
-  imageRegistry: ghcr.io/kushd
+  imageRegistry: ghcr.io/kevinpthorne
   imagePullPolicy: IfNotPresent
 
 manager:
   replicaCount: 1
   image:
     repository: kushd-manager
-    tag: v1.4.0
+    tag: v1.0.3
   # Akri extended resource advertised by akri-udev-ups Configuration
   akriResource: "akri.sh/ups"
   powerManagement:
@@ -26,10 +26,22 @@ manager:
       cpu: 20m
       memory: 64Mi
       akri.sh/ups: 1
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+          - matchExpressions:
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+  nodeSelector: {}
   tolerations:
     - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
       operator: "Exists"
       effect: "NoSchedule"
     - key: "node.kubernetes.io/unschedulable"
@@ -39,7 +51,7 @@ manager:
 agent:
   image:
     repository: kushd-agent
-    tag: v1.4.0
+    tag: v1.0.3
   hostPID: true
   securityContext:
     privileged: true

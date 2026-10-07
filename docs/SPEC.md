@@ -69,7 +69,7 @@ Hardware discovery and device node injection are delegated entirely to **Akri vi
 ### System Invariants
 
 1. **Topology Placement Invariant:** Physical UPS communication hardware (USB/Serial) **must** terminate on a control-plane node. Kushd enforces an in-process, clean exit (`os.Exit(1)`) without stack trace pollution if scheduled on a worker node.
-2. **Akri-Driven Implicit Anchor Scheduling:** `kushd-manager` requests the extended resource `akri.sh/ups: 1` alongside a control-plane `nodeSelector`. The Kubernetes scheduler automatically pins the manager to the exact control-plane node where the UPS is physically connected, eliminating manual node labeling (`kushd.io/ups-anchor`).
+2. **Akri-Driven Implicit Anchor Scheduling:** `kushd-manager` requests the extended resource `akri.sh/ups: 1` alongside control-plane `nodeAffinity`. The Kubernetes scheduler automatically pins the manager to the exact control-plane node where the UPS is physically connected, eliminating manual node labeling (`kushd.io/ups-anchor`).
 3. **Fail-Safe Fencing (STONITH):** To prevent split-brain data corruption when forcefully deleting StatefulSets (`gracePeriodSeconds: 0`), `kushd-agent` implements a three-tier power-off escalation ladder. If primary D-Bus and secondary `systemctl` calls fail, the agent triggers an immediate kernel crash via `/proc/sysrq-trigger`.
 4. **Point-of-No-Return:** Once worker node evacuation begins, abort sequences are rejected. The cluster must reach full poweroff to prevent partitioned states across partially dismantled cluster topologies.
 5. **Configurable Power Cut (`killpower`):** Kushd defaults to `enableKillpower: false` to allow auxiliary rack infrastructure (switches, routers, NAS) to remain on battery reserves. Cutting physical UPS load power is treated as an explicit, opt-in administrative setting.
@@ -654,14 +654,14 @@ charts/kushd/
 
 ```yaml
 global:
-  imageRegistry: ghcr.io/kushd
+  imageRegistry: ghcr.io/kevinpthorne
   imagePullPolicy: IfNotPresent
 
 manager:
   replicaCount: 1
   image:
     repository: kushd-manager
-    tag: v1.4.0
+    tag: v1.0.3
   # Akri extended resource advertised by akri-udev-ups Configuration
   akriResource: "akri.sh/ups"
   powerManagement:
@@ -681,10 +681,22 @@ manager:
       cpu: 20m
       memory: 64Mi
       akri.sh/ups: 1
-  nodeSelector:
-    node-role.kubernetes.io/control-plane: ""
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-role.kubernetes.io/control-plane
+                operator: Exists
+          - matchExpressions:
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+  nodeSelector: {}
   tolerations:
     - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "node-role.kubernetes.io/master"
       operator: "Exists"
       effect: "NoSchedule"
     - key: "node.kubernetes.io/unschedulable"
@@ -694,7 +706,7 @@ manager:
 agent:
   image:
     repository: kushd-agent
-    tag: v1.4.0
+    tag: v1.0.3
   hostPID: true
   securityContext:
     privileged: true
@@ -737,8 +749,14 @@ spec:
         app.kubernetes.io/component: manager
     spec:
       serviceAccountName: {{ include "kushd.fullname" . }}-manager
+      {{- with .Values.manager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.manager.nodeSelector }}
       nodeSelector:
-        {{- toYaml .Values.manager.nodeSelector | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       tolerations:
         {{- toYaml .Values.manager.tolerations | nindent 8 }}
       containers:

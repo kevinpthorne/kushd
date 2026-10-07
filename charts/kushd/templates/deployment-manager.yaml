@@ -17,8 +17,14 @@ spec:
         app.kubernetes.io/component: manager
     spec:
       serviceAccountName: {{ include "kushd.fullname" . }}-manager
+      {{- with .Values.manager.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.manager.nodeSelector }}
       nodeSelector:
-        {{- toYaml .Values.manager.nodeSelector | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       tolerations:
         {{- toYaml .Values.manager.tolerations | nindent 8 }}
       containers:
