@@ -13,7 +13,7 @@
 
         buildKushdBin = name: pkgs.buildGoModule {
           pname = name;
-          version = "1.0.3";
+          version = "1.0.4";
           src = ./.;
           subPackages = [ "cmd/${name}" ];
           vendorHash = null;
@@ -28,6 +28,7 @@
             inherit name;
             tag = "latest";
             contents = extraContents;
+            architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
             config = {
               Entrypoint = [ "${package}/bin/${name}" ];
             };

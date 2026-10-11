@@ -661,7 +661,7 @@ manager:
   replicaCount: 1
   image:
     repository: kushd-manager
-    tag: v1.0.3
+    tag: v1.0.4
   # Akri extended resource advertised by akri-udev-ups Configuration
   akriResource: "akri.sh/ups"
   powerManagement:
@@ -706,7 +706,7 @@ manager:
 agent:
   image:
     repository: kushd-agent
-    tag: v1.0.3
+    tag: v1.0.4
   hostPID: true
   securityContext:
     privileged: true
@@ -879,11 +879,17 @@ jobs:
       - name: Checkout Source
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm64
+
       - name: Install Nix
         uses: cachix/install-nix-action@v27
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
+            extra-platforms = aarch64-linux
 
       - name: Authenticate with GHCR
         uses: docker/login-action@v3
@@ -892,21 +898,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Import Image via Nix
-        run: |
-          nix build .#${{ matrix.package-name }}
-          ./result | docker load
-
-      - name: Publish Image Tags
+      - name: Build and Push AMD64 Image
         run: |
           IMAGE_URI="ghcr.io/${{ github.repository_owner }}/${{ matrix.image-name }}"
           TAG="${GITHUB_REF#refs/tags/}"
 
-          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:${TAG}
-          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:latest
+          nix build .#packages.x86_64-linux.${{ matrix.package-name }}
+          docker load < ./result
+          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:${TAG}-amd64
+          docker push ${IMAGE_URI}:${TAG}-amd64
 
-          docker push ${IMAGE_URI}:${TAG}
-          docker push ${IMAGE_URI}:latest
+      - name: Build and Push ARM64 Image
+        run: |
+          IMAGE_URI="ghcr.io/${{ github.repository_owner }}/${{ matrix.image-name }}"
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          nix build .#packages.aarch64-linux.${{ matrix.package-name }}
+          docker load < ./result
+          docker tag ${{ matrix.image-name }}:latest ${IMAGE_URI}:${TAG}-arm64
+          docker push ${IMAGE_URI}:${TAG}-arm64
+
+      - name: Create and Push Multi-Arch Manifests
+        run: |
+          IMAGE_URI="ghcr.io/${{ github.repository_owner }}/${{ matrix.image-name }}"
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          # Tagged multi-arch manifest
+          docker manifest create ${IMAGE_URI}:${TAG} \
+            ${IMAGE_URI}:${TAG}-amd64 \
+            ${IMAGE_URI}:${TAG}-arm64
+          docker manifest annotate ${IMAGE_URI}:${TAG} ${IMAGE_URI}:${TAG}-amd64 --os linux --arch amd64
+          docker manifest annotate ${IMAGE_URI}:${TAG} ${IMAGE_URI}:${TAG}-arm64 --os linux --arch arm64
+          docker manifest push --purge ${IMAGE_URI}:${TAG}
+
+          # Latest multi-arch manifest
+          docker manifest create ${IMAGE_URI}:latest \
+            ${IMAGE_URI}:${TAG}-amd64 \
+            ${IMAGE_URI}:${TAG}-arm64
+          docker manifest annotate ${IMAGE_URI}:latest ${IMAGE_URI}:${TAG}-amd64 --os linux --arch amd64
+          docker manifest annotate ${IMAGE_URI}:latest ${IMAGE_URI}:${TAG}-arm64 --os linux --arch arm64
+          docker manifest push --purge ${IMAGE_URI}:latest
 
 ```
 

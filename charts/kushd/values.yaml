@@ -6,7 +6,7 @@ manager:
   replicaCount: 1
   image:
     repository: kushd-manager
-    tag: v1.0.3
+    tag: v1.0.4
   # Akri extended resource advertised by akri-udev-ups Configuration
   akriResource: "akri.sh/ups"
   powerManagement:
@@ -51,7 +51,7 @@ manager:
 agent:
   image:
     repository: kushd-agent
-    tag: v1.0.3
+    tag: v1.0.4
   hostPID: true
   securityContext:
     privileged: true
