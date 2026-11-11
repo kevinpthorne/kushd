@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -47,7 +48,7 @@ func NewHostPowerController(opts ControllerOptions) (*HostPowerController, error
 		opts.SyncTimeout = 5 * time.Second
 	}
 
-	conn, err := dbus.Dial(fmt.Sprintf("unix:path=%s", opts.DBusSocketPath))
+	conn, err := dbus.Connect(fmt.Sprintf("unix:path=%s", opts.DBusSocketPath))
 	if err != nil {
 		slog.Warn("Failed to bind host D-Bus socket; will rely on fallback tiers", "error", err, "path", opts.DBusSocketPath)
 		return &HostPowerController{opts: opts, conn: nil}, nil
@@ -83,7 +84,9 @@ func (h *HostPowerController) HaltHost(ctx context.Context) {
 	if h.conn != nil {
 		slog.Info("Tier 1: Invoking systemd PowerOff via D-Bus...")
 		systemd := h.conn.Object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
-		call := systemd.CallWithContext(ctx, "org.freedesktop.systemd1.Manager.PowerOff", 0)
+		callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		call := systemd.CallWithContext(callCtx, "org.freedesktop.systemd1.Manager.PowerOff", 0)
 		if call.Err == nil {
 			slog.Info("D-Bus PowerOff successfully dispatched")
 			return
@@ -93,14 +96,22 @@ func (h *HostPowerController) HaltHost(ctx context.Context) {
 
 	// Tier 2: chroot systemctl Fallback
 	slog.Warn("Tier 2: Escalating to chroot systemctl fallback...")
-	cmd := exec.CommandContext(ctx, "chroot", h.opts.HostRootPath, "/usr/bin/systemctl", "poweroff", "--force", "--force")
-	if err := cmd.Run(); err == nil {
-		slog.Info("chroot systemctl poweroff successfully executed")
-		return
-	} else {
-		slog.Error("Tier 2 Failed: chroot systemctl execution failed", "error", err)
+	systemctlPaths := []string{
+		"/run/current-system/sw/bin/systemctl",
+		"/usr/bin/systemctl",
+		"/bin/systemctl",
 	}
-
+	for _, p := range systemctlPaths {
+		target := filepath.Join(h.opts.HostRootPath, p)
+		if _, err := os.Stat(target); err == nil {
+			cmd := exec.CommandContext(ctx, "chroot", h.opts.HostRootPath, p, "poweroff", "--force", "--force")
+			if err := cmd.Run(); err == nil {
+				slog.Info("chroot systemctl poweroff successfully executed", "path", p)
+				return
+			}
+			slog.Error("Tier 2 Failed: chroot systemctl execution failed", "path", p, "error", err)
+		}
+	}
 	// Tier 3: Hard Fencing / STONITH
 	// If the host cannot be powered off cleanly, force a kernel crash to eliminate split-brain risk
 	h.FenceNode()

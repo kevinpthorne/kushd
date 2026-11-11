@@ -309,13 +309,14 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 			}
 		}
 
+		if !csd.Spec.DryRun && !r.config.DryRun && r.config.AnchorNode != "" {
+			slog.Info("ClusterShutdown completed successfully; halting anchor node", "anchorNode", r.config.AnchorNode)
+			_ = r.annotateNodeStage(ctx, r.config.AnchorNode, v1alpha1.StageHalt, "")
+		}
+
 		return r.transitionPhase(ctx, csd, v1alpha1.PhaseCompleted)
 
 	case v1alpha1.PhaseCompleted:
-		slog.Info("ClusterShutdown completed successfully; halting anchor node", "anchorNode", r.config.AnchorNode)
-		if !csd.Spec.DryRun && !r.config.DryRun && r.config.AnchorNode != "" {
-			_ = r.annotateNodeStage(ctx, r.config.AnchorNode, v1alpha1.StageHalt, "")
-		}
 		return nil
 	}
 
