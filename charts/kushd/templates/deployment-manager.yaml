@@ -39,7 +39,7 @@ spec:
             privileged: true
           ports:
             - name: health
-              containerPort: {{ .Values.manager.healthPort | default 8080 }}
+              containerPort: {{ .Values.manager.healthPort | default 9088 }}
               protocol: TCP
           readinessProbe:
             httpGet:
@@ -61,7 +61,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: HEALTH_PORT
-              value: {{ .Values.manager.healthPort | default 8080 | quote }}
+              value: {{ .Values.manager.healthPort | default 9088 | quote }}
             - name: ENABLE_KILLPOWER
               value: {{ .Values.manager.powerManagement.enableKillpower | quote }}
             - name: KILLPOWER_DELAY_SECONDS

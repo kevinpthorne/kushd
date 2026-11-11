@@ -72,7 +72,7 @@ func main() {
 
 	healthPort := os.Getenv("HEALTH_PORT")
 	if healthPort == "" {
-		healthPort = "8080"
+		healthPort = "9088"
 	}
 
 	dryRun := os.Getenv("DRY_RUN") == "true"

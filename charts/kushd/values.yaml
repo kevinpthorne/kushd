@@ -10,7 +10,7 @@ manager:
   # Akri extended resource advertised by akri-udev-ups Configuration
   akriResource: "akri.sh/ups"
   hostNetwork: true
-  healthPort: 8080
+  healthPort: 9088
   nut:
     host: "localhost"
     port: 3493
