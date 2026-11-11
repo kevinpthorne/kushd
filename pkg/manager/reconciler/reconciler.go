@@ -14,14 +14,16 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"kushd/pkg/agent/power"
 	"kushd/pkg/apis/kushd/v1alpha1"
 	"kushd/pkg/manager/ups"
 )
 
 type ReconcilerConfig struct {
-	AnchorNode   string
-	PollInterval time.Duration
-	DryRun       bool
+	AnchorNode      string
+	PollInterval    time.Duration
+	DryRun          bool
+	PowerController *power.HostPowerController
 }
 
 type ClusterReconciler struct {
@@ -312,10 +314,15 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 		if !csd.Spec.DryRun && !r.config.DryRun && r.config.AnchorNode != "" {
 			slog.Info("ClusterShutdown completed successfully; halting anchor node", "anchorNode", r.config.AnchorNode)
 			_ = r.annotateNodeStage(ctx, r.config.AnchorNode, v1alpha1.StageHalt, "")
+			_ = r.transitionPhase(ctx, csd, v1alpha1.PhaseCompleted)
+			if r.config.PowerController != nil {
+				slog.Info("Halting anchor node host in-process via HostPowerController", "anchorNode", r.config.AnchorNode)
+				r.config.PowerController.HaltHost(ctx)
+			}
+			return nil
 		}
 
 		return r.transitionPhase(ctx, csd, v1alpha1.PhaseCompleted)
-
 	case v1alpha1.PhaseCompleted:
 		return nil
 	}
@@ -521,4 +528,60 @@ func (r *ClusterReconciler) getControlPlaneFollowers(ctx context.Context) ([]cor
 	}
 
 	return followers, nil
+}
+
+// RecoverClusterOnStartup checks whether the cluster recently completed a shutdown
+// and resets node cordons and stage annotations to idle if no active shutdown is in progress.
+func (r *ClusterReconciler) RecoverClusterOnStartup(ctx context.Context) error {
+	list, err := r.dynClient.Resource(v1alpha1.ClusterShutdownGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to list clustershutdowns: %w", err)
+	}
+
+	hasActive := false
+	for _, item := range list.Items {
+		var csd v1alpha1.ClusterShutdown
+		data, err := item.MarshalJSON()
+		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(data, &csd); err != nil {
+			continue
+		}
+		if csd.Status.Phase != v1alpha1.PhaseCompleted &&
+			csd.Status.Phase != v1alpha1.PhaseAborted &&
+			csd.Status.Phase != v1alpha1.PhaseFailed {
+			hasActive = true
+			break
+		}
+	}
+
+	if !hasActive {
+		slog.Info("Startup check: No active ClusterShutdown in progress; ensuring nodes are uncordoned and idle")
+		if err := r.setClusterCordon(ctx, false); err != nil {
+			slog.Warn("Failed to uncordon nodes on startup", "error", err)
+		}
+		if err := r.resetAllNodesStage(ctx, v1alpha1.StageIdle); err != nil {
+			slog.Warn("Failed to reset node stages on startup", "error", err)
+		}
+	}
+
+	return nil
+}
+
+func (r *ClusterReconciler) resetAllNodesStage(ctx context.Context, stage string) error {
+	nodes, err := r.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes.Items {
+		currentStage := node.Annotations[v1alpha1.AnnotationStage]
+		if currentStage == "" || currentStage == stage {
+			continue
+		}
+		if err := r.annotateNodeStage(ctx, node.Name, stage, ""); err != nil {
+			slog.Warn("Failed to reset node stage", "node", node.Name, "error", err)
+		}
+	}
+	return nil
 }

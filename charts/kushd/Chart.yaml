@@ -2,8 +2,8 @@ apiVersion: v2
 name: kushd
 description: Kushd (Kubernetes Shutdown Daemon) - UPS-triggered graceful cluster shutdown orchestrator
 type: application
-version: 1.0.7
-appVersion: 1.0.7
+version: 1.0.8
+appVersion: 1.0.8
 keywords:
   - shutdown
   - ups

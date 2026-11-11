@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"strconv"
+	"strings"
 	"time"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -109,6 +111,17 @@ func (a *Agent) reconcile(ctx context.Context) error {
 			return nil
 		}
 
+		// Boot-loop guard: if the host booted less than 3 minutes ago,
+		// ignore any stale halt directive and reset to idle!
+		uptime := getHostUptime()
+		if uptime > 0 && uptime < 3*time.Minute {
+			slog.Warn("Node recently booted; ignoring stale halt directive to prevent reboot loop",
+				"node", a.config.NodeName, "uptime", uptime.Round(time.Second))
+			_ = a.updateNodeStage(ctx, v1alpha1.StageIdle)
+			_ = a.updateAgentStatus(ctx, v1alpha1.AgentStatusReady)
+			return nil
+		}
+
 		slog.Warn("Halt directive received; preparing host poweroff", "node", a.config.NodeName)
 		if err := a.updateAgentStatus(ctx, v1alpha1.AgentStatusHalting); err != nil {
 			slog.Warn("Failed to update status to halting", "error", err)
@@ -117,7 +130,6 @@ func (a *Agent) reconcile(ctx context.Context) error {
 		// Execute host power off escalation ladder
 		a.powerController.HaltHost(ctx)
 		return nil
-
 	case v1alpha1.StageIdle:
 		if currentStatus != v1alpha1.AgentStatusReady {
 			return a.updateAgentStatus(ctx, v1alpha1.AgentStatusReady)
@@ -143,4 +155,37 @@ func (a *Agent) updateAgentStatus(ctx context.Context, status string) error {
 
 	_, err = a.client.CoreV1().Nodes().Patch(ctx, a.config.NodeName, types.MergePatchType, bytes, metav1.PatchOptions{})
 	return err
+}
+
+func (a *Agent) updateNodeStage(ctx context.Context, stage string) error {
+	patchData := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": map[string]string{
+				v1alpha1.AnnotationStage: stage,
+			},
+		},
+	}
+	bytes, err := json.Marshal(patchData)
+	if err != nil {
+		return err
+	}
+	_, err = a.client.CoreV1().Nodes().Patch(ctx, a.config.NodeName, types.MergePatchType, bytes, metav1.PatchOptions{})
+	return err
+}
+
+func getHostUptime() time.Duration {
+	paths := []string{"/host/proc/uptime", "/proc/uptime"}
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		fields := strings.Fields(string(data))
+		if len(fields) > 0 {
+			if sec, err := strconv.ParseFloat(fields[0], 64); err == nil {
+				return time.Duration(sec * float64(time.Second))
+			}
+		}
+	}
+	return 0
 }

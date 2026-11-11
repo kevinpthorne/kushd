@@ -87,3 +87,23 @@ spec:
               cpu: {{ .Values.manager.resources.requests.cpu }}
               memory: {{ .Values.manager.resources.requests.memory }}
               {{ .Values.manager.akriResource }}: 1
+          volumeMounts:
+            - name: dbus-socket
+              mountPath: /host/run/dbus/system_bus_socket
+            - name: host-root
+              mountPath: /host
+            - name: sysrq-trigger
+              mountPath: /host/proc/sysrq-trigger
+      volumes:
+        - name: dbus-socket
+          hostPath:
+            path: {{ .Values.agent.dbusSocketPath | default "/run/dbus/system_bus_socket" }}
+            type: Socket
+        - name: host-root
+          hostPath:
+            path: {{ .Values.agent.hostRootPath | default "/" }}
+            type: Directory
+        - name: sysrq-trigger
+          hostPath:
+            path: {{ .Values.agent.sysrqTriggerPath | default "/proc/sysrq-trigger" }}
+            type: File

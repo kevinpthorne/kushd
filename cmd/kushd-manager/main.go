@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"kushd/pkg/agent/power"
 	"kushd/pkg/k8sutil"
 	"kushd/pkg/manager/health"
 	"kushd/pkg/manager/reconciler"
@@ -111,15 +112,47 @@ func main() {
 	}
 	hardwarePoller := ups.NewHardwarePoller(dynClient, nutClient, pollerConfig)
 
-	// 4. Cluster Reconciler Loop
+	// 4. Host Power Controller for Anchor Node
+	hostRootPath := os.Getenv("HOST_ROOT_PATH")
+	if hostRootPath == "" {
+		hostRootPath = "/host"
+	}
+	dbusSocketPath := os.Getenv("DBUS_SOCKET_PATH")
+	if dbusSocketPath == "" {
+		dbusSocketPath = "/host/run/dbus/system_bus_socket"
+	}
+	sysrqTriggerPath := os.Getenv("SYSRQ_TRIGGER_PATH")
+	if sysrqTriggerPath == "" {
+		sysrqTriggerPath = "/host/proc/sysrq-trigger"
+	}
+	powerOpts := power.ControllerOptions{
+		DBusSocketPath:   dbusSocketPath,
+		HostRootPath:     hostRootPath,
+		SysrqTriggerPath: sysrqTriggerPath,
+		SyncTimeout:      5 * time.Second,
+	}
+	powerController, err := power.NewHostPowerController(powerOpts)
+	if err != nil {
+		slog.Warn("Failed to initialize HostPowerController for anchor node", "error", err)
+	} else {
+		defer powerController.Close()
+	}
+
+	// 5. Cluster Reconciler Loop
 	reconcilerConfig := reconciler.ReconcilerConfig{
-		AnchorNode:   nodeName,
-		PollInterval: 2 * time.Second,
-		DryRun:       dryRun,
+		AnchorNode:      nodeName,
+		PollInterval:    2 * time.Second,
+		DryRun:          dryRun,
+		PowerController: powerController,
 	}
 	clusterReconciler := reconciler.NewClusterReconciler(clientset, dynClient, nutClient, reconcilerConfig)
 
-	// 5. Health Check Server
+	// Run startup recovery check (uncordon nodes if no active shutdown)
+	if err := clusterReconciler.RecoverClusterOnStartup(ctx); err != nil {
+		slog.Warn("Startup cluster recovery check encountered non-fatal error", "error", err)
+	}
+
+	// 6. Health Check Server
 	healthHandler := health.NewHandler(
 		health.NamedChecker{Name: "hardware-poller", Checker: hardwarePoller},
 		health.NamedChecker{Name: "cluster-reconciler", Checker: clusterReconciler},
