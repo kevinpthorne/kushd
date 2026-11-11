@@ -144,6 +144,64 @@ func TestHardwarePoller_MainsRestoredAbort(t *testing.T) {
 	}
 }
 
+func TestHardwarePoller_ManualTriggerNotAbortedByMains(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+
+	csd := &v1alpha1.ClusterShutdown{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: fmt.Sprintf("%s/%s", v1alpha1.GroupName, v1alpha1.Version),
+			Kind:       "ClusterShutdown",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "manual-trigger-pending",
+		},
+		Spec: v1alpha1.ClusterShutdownSpec{
+			TriggerSource: "ManualAdminTrigger",
+			Abort:         false,
+		},
+		Status: v1alpha1.ClusterShutdownStatus{
+			Phase: v1alpha1.PhasePending,
+		},
+	}
+	data, _ := json.Marshal(csd)
+	var u unstructured.Unstructured
+	_ = json.Unmarshal(data, &u.Object)
+
+	dynClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		v1alpha1.ClusterShutdownGVR: "ClusterShutdownList",
+	}, &u)
+
+	mockUPS := &mockPollerUPSClient{
+		status: &UPSStatus{
+			State:                   "OL",
+			BatteryChargePercent:    100,
+			EstimatedRuntimeSeconds: 3600,
+		},
+	}
+
+	config := PollerConfig{
+		AnchorNode: "cp-node-1",
+	}
+
+	poller := NewHardwarePoller(dynClient, mockUPS, config)
+
+	err := poller.pollOnce(ctx)
+	if err != nil {
+		t.Fatalf("pollOnce failed: %v", err)
+	}
+
+	item, err := dynClient.Resource(v1alpha1.ClusterShutdownGVR).Get(ctx, "manual-trigger-pending", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get item: %v", err)
+	}
+
+	spec := item.Object["spec"].(map[string]interface{})
+	if spec["abort"] == true {
+		t.Fatalf("manual trigger should not be aborted when mains power is OL")
+	}
+}
+
 func TestHardwarePoller_Health(t *testing.T) {
 	ctx := context.Background()
 	scheme := runtime.NewScheme()

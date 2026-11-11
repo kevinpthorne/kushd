@@ -157,12 +157,14 @@ func (p *HardwarePoller) pollOnce(ctx context.Context) error {
 			return p.createClusterShutdown(ctx, status)
 		}
 	} else if isOnline && activeCSD != nil {
-		// Mains restored
-		phase := v1alpha1.ClusterShutdownPhase(activeCSD.Status.Phase)
-		if phase == v1alpha1.PhasePending || phase == v1alpha1.PhaseCordoningCluster {
-			if !activeCSD.Spec.Abort {
-				slog.Info("Mains power restored (OL) before Point-of-No-Return; signaling abort", "phase", phase)
-				return p.setAbort(ctx, activeCSD.Name)
+		// Mains restored - only abort automated UPS triggers, not explicit manual administrator triggers
+		if !strings.HasPrefix(strings.ToLower(activeCSD.Spec.TriggerSource), "manual") {
+			phase := v1alpha1.ClusterShutdownPhase(activeCSD.Status.Phase)
+			if phase == v1alpha1.PhasePending || phase == v1alpha1.PhaseCordoningCluster {
+				if !activeCSD.Spec.Abort {
+					slog.Info("Mains power restored (OL) before Point-of-No-Return; signaling abort", "phase", phase)
+					return p.setAbort(ctx, activeCSD.Name)
+				}
 			}
 		}
 	}
