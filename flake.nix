@@ -13,7 +13,7 @@
 
         buildKushdBin = name: pkgs.buildGoModule {
           pname = name;
-          version = "1.0.6";
+          version = "1.0.7";
           src = ./.;
           subPackages = [ "cmd/${name}" ];
           vendorHash = null;
