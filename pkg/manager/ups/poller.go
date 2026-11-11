@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
-
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -42,6 +42,11 @@ type HardwarePoller struct {
 	dynClient dynamic.Interface
 	upsClient UPSClient
 	config    PollerConfig
+
+	mu           sync.RWMutex
+	hasPolled    bool
+	lastPollTime time.Time
+	lastPollErr  error
 }
 
 func NewHardwarePoller(dynClient dynamic.Interface, upsClient UPSClient, config PollerConfig) *HardwarePoller {
@@ -72,6 +77,11 @@ func (p *HardwarePoller) Run(ctx context.Context) error {
 		"runtimeLowThreshold", p.config.RuntimeLowSeconds,
 	)
 
+	// Immediate poll on start
+	if err := p.pollOnce(ctx); err != nil {
+		slog.Warn("Hardware poller initial check failed", "error", err)
+	}
+
 	ticker := time.NewTicker(p.config.PollInterval)
 	defer ticker.Stop()
 
@@ -88,8 +98,32 @@ func (p *HardwarePoller) Run(ctx context.Context) error {
 	}
 }
 
+// Health returns an error if the poller has not polled yet, if the latest poll failed,
+// or if the polling loop has stalled.
+func (p *HardwarePoller) Health() error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if !p.hasPolled {
+		return fmt.Errorf("initial UPS poll has not completed")
+	}
+	if p.lastPollErr != nil {
+		return fmt.Errorf("UPS poller error: %w", p.lastPollErr)
+	}
+	if time.Since(p.lastPollTime) > 3*p.config.PollInterval {
+		return fmt.Errorf("UPS poller stalled (last poll was %v ago)", time.Since(p.lastPollTime).Round(time.Second))
+	}
+	return nil
+}
+
 func (p *HardwarePoller) pollOnce(ctx context.Context) error {
 	status, err := p.upsClient.GetStatus(ctx)
+	p.mu.Lock()
+	p.hasPolled = true
+	p.lastPollTime = time.Now()
+	p.lastPollErr = err
+	p.mu.Unlock()
+
 	if err != nil {
 		return fmt.Errorf("failed to fetch UPS status: %w", err)
 	}

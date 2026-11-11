@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -220,5 +221,32 @@ func TestReconciler_KillpowerClampingAndFinalizing(t *testing.T) {
 	status := updatedCSD.Object["status"].(map[string]interface{})
 	if status["phase"] != string(v1alpha1.PhaseCompleted) {
 		t.Fatalf("expected phase Completed, got %v", status["phase"])
+	}
+}
+
+func TestClusterReconciler_Health(t *testing.T) {
+	ctx := context.Background()
+	scheme := newTestScheme()
+	client := fake.NewSimpleClientset()
+	csdObj := createTestCSD("csd-health", v1alpha1.PhaseCompleted, false)
+	dynClient := dynamicfake.NewSimpleDynamicClient(scheme, csdObj)
+	mockUPS := &mockUPSClient{}
+
+	reconciler := NewClusterReconciler(client, dynClient, mockUPS, ReconcilerConfig{
+		AnchorNode:   "cp-anchor",
+		PollInterval: 10 * time.Millisecond,
+	})
+
+	// 1. Before initial reconcile
+	if err := reconciler.Health(); err == nil {
+		t.Fatal("expected error before initial reconcile, got nil")
+	}
+
+	// 2. After reconcile
+	if err := reconciler.reconcile(ctx); err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if err := reconciler.Health(); err != nil {
+		t.Fatalf("expected healthy, got: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -17,9 +18,13 @@ import (
 
 type mockPollerUPSClient struct {
 	status *UPSStatus
+	err    error
 }
 
 func (m *mockPollerUPSClient) GetStatus(ctx context.Context) (*UPSStatus, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
 	return m.status, nil
 }
 
@@ -136,5 +141,45 @@ func TestHardwarePoller_MainsRestoredAbort(t *testing.T) {
 	spec := item.Object["spec"].(map[string]interface{})
 	if spec["abort"] != true {
 		t.Fatalf("expected spec.abort to be set to true upon mains restoration")
+	}
+}
+
+func TestHardwarePoller_Health(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	dynClient := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(scheme, map[schema.GroupVersionResource]string{
+		v1alpha1.ClusterShutdownGVR: "ClusterShutdownList",
+	})
+
+	mockUPS := &mockPollerUPSClient{
+		status: &UPSStatus{
+			State: "OL",
+		},
+	}
+	config := PollerConfig{
+		AnchorNode:   "cp-node-1",
+		PollInterval: 10 * time.Millisecond,
+	}
+
+	poller := NewHardwarePoller(dynClient, mockUPS, config)
+
+	// 1. Before any poll
+	if err := poller.Health(); err == nil {
+		t.Fatal("expected error before initial poll, got nil")
+	}
+
+	// 2. After successful poll
+	if err := poller.pollOnce(ctx); err != nil {
+		t.Fatalf("pollOnce failed: %v", err)
+	}
+	if err := poller.Health(); err != nil {
+		t.Fatalf("expected healthy, got: %v", err)
+	}
+
+	// 3. After failing poll
+	mockUPS.err = fmt.Errorf("upsc execution failed: exit status 1")
+	_ = poller.pollOnce(ctx)
+	if err := poller.Health(); err == nil {
+		t.Fatal("expected error after failing poll, got nil")
 	}
 }

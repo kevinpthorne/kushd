@@ -52,8 +52,12 @@ func (c *NUTClient) target() string {
 func (c *NUTClient) GetStatus(ctx context.Context) (*UPSStatus, error) {
 	// Execute upsc command
 	cmd := exec.CommandContext(ctx, "upsc", c.target())
-	output, err := cmd.Output()
+	output, err := cmd.CombinedOutput()
 	if err != nil {
+		errMsg := strings.TrimSpace(string(output))
+		if errMsg != "" {
+			return nil, fmt.Errorf("upsc %s execution failed: %s (%w)", c.target(), errMsg, err)
+		}
 		return nil, fmt.Errorf("upsc %s execution failed: %w", c.target(), err)
 	}
 

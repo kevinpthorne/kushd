@@ -6,9 +6,15 @@ manager:
   replicaCount: 1
   image:
     repository: kushd-manager
-    tag: v1.0.4
+    tag: v1.0.5
   # Akri extended resource advertised by akri-udev-ups Configuration
   akriResource: "akri.sh/ups"
+  hostNetwork: true
+  healthPort: 8080
+  nut:
+    host: "localhost"
+    port: 3493
+    upsName: "ups"
   powerManagement:
     enableKillpower: false
     # Must exceed 90s systemd stop-job timeout + buffer sync margin
@@ -51,7 +57,7 @@ manager:
 agent:
   image:
     repository: kushd-agent
-    tag: v1.0.4
+    tag: v1.0.5
   hostPID: true
   securityContext:
     privileged: true

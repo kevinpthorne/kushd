@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"syscall"
 	"time"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -29,6 +29,11 @@ type ClusterReconciler struct {
 	dynClient dynamic.Interface
 	upsClient ups.UPSClient
 	config    ReconcilerConfig
+
+	mu                sync.RWMutex
+	hasReconciled     bool
+	lastReconcileTime time.Time
+	lastReconcileErr  error
 }
 
 func NewClusterReconciler(
@@ -52,6 +57,11 @@ func NewClusterReconciler(
 func (r *ClusterReconciler) Run(ctx context.Context) error {
 	slog.Info("Starting cluster reconciler loop", "anchorNode", r.config.AnchorNode)
 
+	// Immediate check on start
+	if err := r.reconcile(ctx); err != nil {
+		slog.Error("Reconcile initial check failed", "error", err)
+	}
+
 	ticker := time.NewTicker(r.config.PollInterval)
 	defer ticker.Stop()
 
@@ -68,8 +78,32 @@ func (r *ClusterReconciler) Run(ctx context.Context) error {
 	}
 }
 
+// Health returns an error if the reconciler has not completed an initial check,
+// if the latest reconciliation failed, or if the reconciliation loop has stalled.
+func (r *ClusterReconciler) Health() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if !r.hasReconciled {
+		return fmt.Errorf("initial reconciliation has not completed")
+	}
+	if r.lastReconcileErr != nil {
+		return fmt.Errorf("cluster reconciler failing: %w", r.lastReconcileErr)
+	}
+	if time.Since(r.lastReconcileTime) > 3*r.config.PollInterval {
+		return fmt.Errorf("cluster reconciler stalled (last reconcile was %v ago)", time.Since(r.lastReconcileTime).Round(time.Second))
+	}
+	return nil
+}
+
 func (r *ClusterReconciler) reconcile(ctx context.Context) error {
 	list, err := r.dynClient.Resource(v1alpha1.ClusterShutdownGVR).List(ctx, metav1.ListOptions{})
+	r.mu.Lock()
+	r.hasReconciled = true
+	r.lastReconcileTime = time.Now()
+	r.lastReconcileErr = err
+	r.mu.Unlock()
+
 	if err != nil {
 		return fmt.Errorf("failed to list clustershutdowns: %w", err)
 	}

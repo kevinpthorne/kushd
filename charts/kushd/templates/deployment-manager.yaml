@@ -17,6 +17,10 @@ spec:
         app.kubernetes.io/component: manager
     spec:
       serviceAccountName: {{ include "kushd.fullname" . }}-manager
+      {{- if .Values.manager.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.manager.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
@@ -33,15 +37,47 @@ spec:
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
           securityContext:
             privileged: true
+          ports:
+            - name: health
+              containerPort: {{ .Values.manager.healthPort | default 8080 }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: HEALTH_PORT
+              value: {{ .Values.manager.healthPort | default 8080 | quote }}
             - name: ENABLE_KILLPOWER
               value: {{ .Values.manager.powerManagement.enableKillpower | quote }}
             - name: KILLPOWER_DELAY_SECONDS
               value: {{ .Values.manager.powerManagement.killpowerDelaySeconds | quote }}
+            - name: TARGET_OUTLET_GROUP
+              value: {{ .Values.manager.powerManagement.targetOutletGroup | quote }}
+            - name: BATTERY_LOW_PERCENT
+              value: {{ .Values.manager.thresholds.batteryLowPercent | quote }}
+            - name: RUNTIME_LOW_SECONDS
+              value: {{ .Values.manager.thresholds.runtimeLowSeconds | quote }}
+            - name: NUT_HOST
+              value: {{ .Values.manager.nut.host | default "localhost" | quote }}
+            - name: NUT_PORT
+              value: {{ .Values.manager.nut.port | default 3493 | quote }}
+            - name: UPS_NAME
+              value: {{ .Values.manager.nut.upsName | default "ups" | quote }}
           resources:
             limits:
               cpu: {{ .Values.manager.resources.limits.cpu }}

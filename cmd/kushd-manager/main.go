@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"kushd/pkg/k8sutil"
+	"kushd/pkg/manager/health"
 	"kushd/pkg/manager/reconciler"
 	"kushd/pkg/manager/topology"
 	"kushd/pkg/manager/ups"
@@ -67,8 +70,12 @@ func main() {
 		}
 	}
 
-	dryRun := os.Getenv("DRY_RUN") == "true"
+	healthPort := os.Getenv("HEALTH_PORT")
+	if healthPort == "" {
+		healthPort = "8080"
+	}
 
+	dryRun := os.Getenv("DRY_RUN") == "true"
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
@@ -112,8 +119,25 @@ func main() {
 	}
 	clusterReconciler := reconciler.NewClusterReconciler(clientset, dynClient, nutClient, reconcilerConfig)
 
+	// 5. Health Check Server
+	healthHandler := health.NewHandler(
+		health.NamedChecker{Name: "hardware-poller", Checker: hardwarePoller},
+		health.NamedChecker{Name: "cluster-reconciler", Checker: clusterReconciler},
+	)
+	healthServer := &http.Server{
+		Addr:    ":" + healthPort,
+		Handler: healthHandler,
+	}
+
 	// Launch concurrent loops
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 3)
+
+	go func() {
+		slog.Info("Starting health check server", "port", healthPort)
+		if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- fmt.Errorf("health server failed: %w", err)
+		}
+	}()
 
 	go func() {
 		if err := hardwarePoller.Run(ctx); err != nil && err != context.Canceled {
@@ -127,13 +151,21 @@ func main() {
 		}
 	}()
 
-	slog.Info("kushd-manager running (hardware poller + reconciler active)", "node", nodeName)
+	slog.Info("kushd-manager running (health server + hardware poller + reconciler active)", "node", nodeName, "healthPort", healthPort)
 
 	select {
 	case <-ctx.Done():
 		slog.Info("kushd-manager received shutdown signal")
 	case err := <-errChan:
 		slog.Error("kushd-manager loop exited with error", "error", err)
+		cancel()
+		shutdownCtx, sCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer sCancel()
+		_ = healthServer.Shutdown(shutdownCtx)
 		os.Exit(1)
 	}
+
+	shutdownCtx, sCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer sCancel()
+	_ = healthServer.Shutdown(shutdownCtx)
 }
