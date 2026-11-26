@@ -91,6 +91,14 @@ spec:
                   format: date-time
                 anchorNode:
                   type: string
+                anchorBootID:
+                  type: string
+                  description: "Host kernel boot ID authorizing this shutdown's anchor."
+                nodeBootIDs:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: "Node boot identities captured before any shutdown actions."
                 conditions:
                   type: array
                   items:

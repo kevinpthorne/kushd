@@ -71,8 +71,10 @@ Hardware discovery and device node injection are delegated entirely to **Akri vi
 1. **Topology Placement Invariant:** Physical UPS communication hardware (USB/Serial) **must** terminate on a control-plane node. Kushd enforces an in-process, clean exit (`os.Exit(1)`) without stack trace pollution if scheduled on a worker node.
 2. **Akri-Driven Implicit Anchor Scheduling:** `kushd-manager` requests the extended resource `akri.sh/ups: 1` alongside control-plane `nodeAffinity`. The Kubernetes scheduler automatically pins the manager to the exact control-plane node where the UPS is physically connected, eliminating manual node labeling (`kushd.io/ups-anchor`).
 3. **Fail-Safe Fencing (STONITH):** To prevent split-brain data corruption when forcefully deleting StatefulSets (`gracePeriodSeconds: 0`), `kushd-agent` implements a three-tier power-off escalation ladder. If primary D-Bus and secondary `systemctl` calls fail, the agent triggers an immediate kernel crash via `/proc/sysrq-trigger`.
-4. **Point-of-No-Return:** Once worker node evacuation begins, abort sequences are rejected. The cluster must reach full poweroff to prevent partitioned states across partially dismantled cluster topologies.
+4. **Point-of-No-Return:** Once worker node evacuation begins, normal abort sequences are rejected. Boot or node-inventory changes invalidate the old workflow even after this point: recovering nodes must never replay an earlier boot's shutdown.
 5. **Configurable Power Cut (`killpower`):** Kushd defaults to `enableKillpower: false` to allow auxiliary rack infrastructure (switches, routers, NAS) to remain on battery reserves. Cutting physical UPS load power is treated as an explicit, opt-in administrative setting.
+6. **Boot-Bound Execution:** Before any node mutation, persist the anchor's host boot ID and every node's registered boot ID in `ClusterShutdown.status`. Both binaries read the mounted host's `/host/proc/sys/kernel/random/boot_id` and fail closed if unavailable. Directives carry the target boot ID and shutdown UID; agents acknowledge only unchanged directives for their current host boot. A same-boot process restart can resume, but a host reboot retires old workflows. No uptime grace period is used.
+7. **Owned Recovery:** Only clear directives with the matching shutdown UID and cordons with the matching `kushd.io/cordoned-by` owner. Do not claim pre-existing cordons, reset unrelated annotations, or blanket-uncordon nodes during startup.
 
 ---
 
@@ -82,7 +84,7 @@ Hardware discovery and device node injection are delegated entirely to **Akri vi
 
 Deployed as a single-replica `Deployment` scheduled via Akri resource binding. It runs two concurrent loops within a single Go process:
 
-* **Hardware Poller Loop:** Directly accesses the device node injected by the Akri Device Plugin (e.g., `/dev/bus/usb/001/004`) using NUT or direct USB HID. Polls battery metrics, monitors power transitions (`ONBATT`, `LOWBATT`), and creates or updates the `ClusterShutdown` Custom Resource.
+* **Hardware Poller Loop:** Directly accesses the device node injected by the Akri Device Plugin (e.g., `/dev/bus/usb/001/004`) using NUT or direct USB HID. Automatic shutdown requires an explicit `OB` token without `OL`, together with `LB`/`LOWBATT` or low positive charge/runtime. Online, contradictory, unknown, and nonpositive readings cannot independently trigger shutdown. The request records the raw UPS state in `kushd.io/ups-state`.
 * **Cluster Reconciler Loop:** Watches `ClusterShutdown` resources, manages the shutdown state machine, cordons nodes, writes execution directives and timeouts to `kushd-agent` annotations, evaluates abort conditions, and executes final anchor host poweroff.
 
 ### 2.2 `kushd-agent` (Privileged DaemonSet)
@@ -265,6 +267,12 @@ spec:
                   format: date-time
                 anchorNode:
                   type: string
+                anchorBootID:
+                  type: string
+                nodeBootIDs:
+                  type: object
+                  additionalProperties:
+                    type: string
                 conditions:
                   type: array
                   items:
@@ -291,6 +299,10 @@ spec:
 | `kushd.io/stage` | `idle`, `drain`, `halt` | Manager $\to$ Agent | Target lifecycle state command. |
 | `kushd.io/drain-timeout` | Duration string (e.g., `120s`) | Manager $\to$ Agent | Evacuation window used by agent to schedule polite vs. forceful eviction. |
 | `kushd.io/agent-status` | `ready`, `draining`, `drained`, `halting`, `failed` | Agent $\to$ Manager | Reported execution state of the node host. |
+| `kushd.io/directive-boot-id` | Host boot UUID | Manager $\to$ Agent | Target boot captured in the shutdown status; must match the agent's actual host boot. |
+| `kushd.io/shutdown-uid` | ClusterShutdown UID | Manager $\to$ Agent | Owns the directive; must remain unchanged before acknowledging or halting. |
+| `kushd.io/agent-boot-id` | Host boot UUID | Agent $\to$ Manager | Binds the acknowledgement to the current host boot. |
+| `kushd.io/cordoned-by` | ClusterShutdown UID | Manager $\to$ Recovery | Only set when Kushd changes a schedulable node to cordoned; only that owner may release it. |
 
 ---
 

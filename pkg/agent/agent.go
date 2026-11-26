@@ -4,33 +4,35 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"os"
-	"strconv"
-	"strings"
-	"time"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"log/slog"
+	"time"
 
 	"kushd/pkg/agent/drain"
-	"kushd/pkg/agent/power"
 	"kushd/pkg/apis/kushd/v1alpha1"
+	"kushd/pkg/bootid"
 )
 
 type AgentConfig struct {
-	NodeName           string
-	PollInterval       time.Duration
-	PowerControllerOpts power.ControllerOptions
+	NodeName     string
+	PollInterval time.Duration
+	HostBootID   string
+}
+
+type hostPowerController interface {
+	HaltHost(context.Context)
 }
 
 type Agent struct {
 	client          kubernetes.Interface
 	config          AgentConfig
-	powerController *power.HostPowerController
+	powerController hostPowerController
 }
 
-func NewAgent(client kubernetes.Interface, config AgentConfig, powerController *power.HostPowerController) *Agent {
+func NewAgent(client kubernetes.Interface, config AgentConfig, powerController hostPowerController) *Agent {
 	if config.PollInterval <= 0 {
 		config.PollInterval = 2 * time.Second
 	}
@@ -43,20 +45,18 @@ func NewAgent(client kubernetes.Interface, config AgentConfig, powerController *
 
 // Run starts the agent reconciliation loop until context cancellation.
 func (a *Agent) Run(ctx context.Context) error {
-	slog.Info("Starting kushd-agent", "node", a.config.NodeName)
-
-	// Set initial status to ready
-	if err := a.updateAgentStatus(ctx, v1alpha1.AgentStatusReady); err != nil {
-		slog.Warn("Failed to set initial agent status on node", "error", err)
+	if !bootid.Valid(a.config.HostBootID) {
+		return fmt.Errorf("valid host boot ID is required")
 	}
-
+	slog.Info("Starting kushd-agent", "node", a.config.NodeName, "bootID", a.config.HostBootID)
+	if err := a.reconcile(ctx); err != nil {
+		slog.Error("Initial agent reconciliation failed", "error", err)
+	}
 	ticker := time.NewTicker(a.config.PollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("Shutting down kushd-agent loop")
 			return ctx.Err()
 		case <-ticker.C:
 			if err := a.reconcile(ctx); err != nil {
@@ -68,25 +68,35 @@ func (a *Agent) Run(ctx context.Context) error {
 
 // Reconcile checks node annotations and triggers drain or halt actions.
 func (a *Agent) reconcile(ctx context.Context) error {
+	if !bootid.Valid(a.config.HostBootID) {
+		return fmt.Errorf("valid host boot ID is required")
+	}
 	node, err := a.client.CoreV1().Nodes().Get(ctx, a.config.NodeName, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to get node %s: %w", a.config.NodeName, err)
 	}
-
 	stage := node.Annotations[v1alpha1.AnnotationStage]
+	if stage == v1alpha1.StageDrain || stage == v1alpha1.StageHalt {
+		if node.Annotations[v1alpha1.AnnotationDirectiveBootID] != a.config.HostBootID ||
+			node.Annotations[v1alpha1.AnnotationShutdownUID] == "" {
+			slog.Warn("Rejecting stale or unbound shutdown directive", "node", a.config.NodeName,
+				"stage", stage, "directiveBootID", node.Annotations[v1alpha1.AnnotationDirectiveBootID],
+				"hostBootID", a.config.HostBootID)
+			return a.clearStaleDirective(ctx, node)
+		}
+	}
 	currentStatus := node.Annotations[v1alpha1.AnnotationAgentStatus]
-
+	if node.Annotations[v1alpha1.AnnotationAgentBootID] != a.config.HostBootID {
+		currentStatus = ""
+	}
 	switch stage {
 	case v1alpha1.StageDrain:
 		if currentStatus == v1alpha1.AgentStatusDrained || currentStatus == v1alpha1.AgentStatusDraining {
 			return nil
 		}
-
-		slog.Info("Drain directive received", "node", a.config.NodeName)
-		if err := a.updateAgentStatus(ctx, v1alpha1.AgentStatusDraining); err != nil {
-			slog.Warn("Failed to update status to draining", "error", err)
+		if err := a.updateAgentStatus(ctx, node, v1alpha1.AgentStatusDraining); err != nil {
+			return err
 		}
-
 		timeoutStr := node.Annotations[v1alpha1.AnnotationDrainTimeout]
 		if timeoutStr == "" {
 			timeoutStr = v1alpha1.DefaultDrainTimeout
@@ -96,96 +106,79 @@ func (a *Agent) reconcile(ctx context.Context) error {
 			slog.Warn("Failed to parse drain timeout, falling back to 90s", "val", timeoutStr, "error", err)
 			timeout = 90 * time.Second
 		}
-
 		if err := drain.ExecuteEscalatingDrain(ctx, a.client, a.config.NodeName, timeout); err != nil {
-			slog.Error("Drain execution failed", "error", err)
-			_ = a.updateAgentStatus(ctx, v1alpha1.AgentStatusFailed)
+			if statusErr := a.updateAgentStatus(ctx, node, v1alpha1.AgentStatusFailed); statusErr != nil {
+				slog.Warn("Failed to acknowledge drain failure", "error", statusErr)
+			}
 			return err
 		}
-
-		slog.Info("Drain completed successfully", "node", a.config.NodeName)
-		return a.updateAgentStatus(ctx, v1alpha1.AgentStatusDrained)
-
+		return a.updateAgentStatus(ctx, node, v1alpha1.AgentStatusDrained)
 	case v1alpha1.StageHalt:
 		if currentStatus == v1alpha1.AgentStatusHalting {
 			return nil
 		}
-
-		// Boot-loop guard: if the host booted less than 3 minutes ago,
-		// ignore any stale halt directive and reset to idle!
-		uptime := getHostUptime()
-		if uptime > 0 && uptime < 3*time.Minute {
-			slog.Warn("Node recently booted; ignoring stale halt directive to prevent reboot loop",
-				"node", a.config.NodeName, "uptime", uptime.Round(time.Second))
-			_ = a.updateNodeStage(ctx, v1alpha1.StageIdle)
-			_ = a.updateAgentStatus(ctx, v1alpha1.AgentStatusReady)
-			return nil
+		if a.powerController == nil {
+			return fmt.Errorf("host power controller is unavailable")
 		}
-
-		slog.Warn("Halt directive received; preparing host poweroff", "node", a.config.NodeName)
-		if err := a.updateAgentStatus(ctx, v1alpha1.AgentStatusHalting); err != nil {
-			slog.Warn("Failed to update status to halting", "error", err)
+		if err := a.updateAgentStatus(ctx, node, v1alpha1.AgentStatusHalting); err != nil {
+			return err
 		}
-
-		// Execute host power off escalation ladder
+		slog.Warn("Executing boot-bound halt directive", "node", a.config.NodeName, "bootID", a.config.HostBootID)
 		a.powerController.HaltHost(ctx)
-		return nil
-	case v1alpha1.StageIdle:
+	case "", v1alpha1.StageIdle:
 		if currentStatus != v1alpha1.AgentStatusReady {
-			return a.updateAgentStatus(ctx, v1alpha1.AgentStatusReady)
+			return a.updateAgentStatus(ctx, node, v1alpha1.AgentStatusReady)
 		}
 	}
-
 	return nil
 }
 
-func (a *Agent) updateAgentStatus(ctx context.Context, status string) error {
+func (a *Agent) updateAgentStatus(ctx context.Context, directive *corev1.Node, status string) error {
+	current, err := a.client.CoreV1().Nodes().Get(ctx, a.config.NodeName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if current.UID != directive.UID ||
+		current.Annotations[v1alpha1.AnnotationStage] != directive.Annotations[v1alpha1.AnnotationStage] ||
+		current.Annotations[v1alpha1.AnnotationDirectiveBootID] != directive.Annotations[v1alpha1.AnnotationDirectiveBootID] ||
+		current.Annotations[v1alpha1.AnnotationShutdownUID] != directive.Annotations[v1alpha1.AnnotationShutdownUID] {
+		return fmt.Errorf("shutdown directive changed before acknowledgement")
+	}
 	patchData := map[string]interface{}{
 		"metadata": map[string]interface{}{
+			"resourceVersion": current.ResourceVersion,
 			"annotations": map[string]string{
 				v1alpha1.AnnotationAgentStatus: status,
+				v1alpha1.AnnotationAgentBootID: a.config.HostBootID,
 			},
 		},
 	}
-
-	bytes, err := json.Marshal(patchData)
+	data, err := json.Marshal(patchData)
 	if err != nil {
 		return err
 	}
-
-	_, err = a.client.CoreV1().Nodes().Patch(ctx, a.config.NodeName, types.MergePatchType, bytes, metav1.PatchOptions{})
+	_, err = a.client.CoreV1().Nodes().Patch(ctx, a.config.NodeName, types.MergePatchType, data, metav1.PatchOptions{})
 	return err
 }
 
-func (a *Agent) updateNodeStage(ctx context.Context, stage string) error {
-	patchData := map[string]interface{}{
+func (a *Agent) clearStaleDirective(ctx context.Context, node *corev1.Node) error {
+	patch := map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"annotations": map[string]string{
-				v1alpha1.AnnotationStage: stage,
+			"resourceVersion": node.ResourceVersion,
+			"annotations": map[string]interface{}{
+				v1alpha1.AnnotationStage:           nil,
+				v1alpha1.AnnotationDrainTimeout:    nil,
+				v1alpha1.AnnotationDirectiveBootID: nil,
+				v1alpha1.AnnotationShutdownUID:     nil,
+				v1alpha1.AnnotationAgentStatus:     v1alpha1.AgentStatusReady,
+				v1alpha1.AnnotationAgentBootID:     a.config.HostBootID,
 			},
 		},
 	}
-	bytes, err := json.Marshal(patchData)
+	data, err := json.Marshal(patch)
 	if err != nil {
 		return err
 	}
-	_, err = a.client.CoreV1().Nodes().Patch(ctx, a.config.NodeName, types.MergePatchType, bytes, metav1.PatchOptions{})
+	_, err = a.client.CoreV1().Nodes().Patch(ctx, a.config.NodeName, types.MergePatchType, data, metav1.PatchOptions{})
 	return err
-}
-
-func getHostUptime() time.Duration {
-	paths := []string{"/host/proc/uptime", "/proc/uptime"}
-	for _, p := range paths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue
-		}
-		fields := strings.Fields(string(data))
-		if len(fields) > 0 {
-			if sec, err := strconv.ParseFloat(fields[0], 64); err == nil {
-				return time.Duration(sec * float64(time.Second))
-			}
-		}
-	}
-	return 0
 }

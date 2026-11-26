@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -19,10 +20,10 @@ import (
 )
 
 type mockUPSClient struct {
-	status           *ups.UPSStatus
-	killpowerCalled  bool
-	killpowerDelay   int
-	killpowerOutlet  string
+	status          *ups.UPSStatus
+	killpowerCalled bool
+	killpowerDelay  int
+	killpowerOutlet string
 }
 
 func (m *mockUPSClient) GetStatus(ctx context.Context) (*ups.UPSStatus, error) {
@@ -54,6 +55,7 @@ func createTestCSD(name string, phase v1alpha1.ClusterShutdownPhase, abort bool)
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: name,
+			UID:  types.UID(name),
 		},
 		Spec: v1alpha1.ClusterShutdownSpec{
 			TriggerSource:           "test-ups",
@@ -67,9 +69,11 @@ func createTestCSD(name string, phase v1alpha1.ClusterShutdownPhase, abort bool)
 			},
 		},
 		Status: v1alpha1.ClusterShutdownStatus{
-			Phase:      phase,
-			StartTime:  &now,
-			AnchorNode: "cp-anchor",
+			Phase:        phase,
+			StartTime:    &now,
+			AnchorNode:   "cp-anchor",
+			AnchorBootID: managerBoot,
+			NodeBootIDs:  map[string]string{"cp-anchor": managerBoot},
 		},
 	}
 
@@ -86,7 +90,8 @@ func TestReconciler_AbortBeforePointOfNoReturn(t *testing.T) {
 	// Node in cluster
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "worker-1",
+			Name:        "worker-1",
+			Annotations: map[string]string{v1alpha1.AnnotationCordonOwner: "csd-abort-cordon"},
 		},
 		Spec: corev1.NodeSpec{
 			Unschedulable: true,
@@ -99,6 +104,7 @@ func TestReconciler_AbortBeforePointOfNoReturn(t *testing.T) {
 
 	reconciler := NewClusterReconciler(client, dynClient, &mockUPSClient{}, ReconcilerConfig{
 		AnchorNode: "cp-anchor",
+		HostBootID: managerBoot,
 	})
 
 	err := reconciler.reconcile(ctx)
@@ -132,19 +138,25 @@ func TestReconciler_PointOfNoReturnAbortRejection(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "worker-1",
 			Annotations: map[string]string{
-				v1alpha1.AnnotationStage:       v1alpha1.StageDrain,
-				v1alpha1.AnnotationAgentStatus: v1alpha1.AgentStatusDrained,
+				v1alpha1.AnnotationStage:           v1alpha1.StageDrain,
+				v1alpha1.AnnotationAgentStatus:     v1alpha1.AgentStatusDrained,
+				v1alpha1.AnnotationDirectiveBootID: workerBoot,
+				v1alpha1.AnnotationAgentBootID:     workerBoot,
+				v1alpha1.AnnotationShutdownUID:     "csd-point-of-no-return",
 			},
 		},
+		Status: corev1.NodeStatus{NodeInfo: corev1.NodeSystemInfo{BootID: workerBoot}},
 	}
-	client := fake.NewSimpleClientset(worker)
+	client := fake.NewSimpleClientset(worker, safetyNode("cp-anchor", managerBoot))
 
 	// CSD in DrainingWorkers with abort requested
 	csdObj := createTestCSD("csd-point-of-no-return", v1alpha1.PhaseDrainingWorkers, true)
+	csdObj.Object["status"].(map[string]interface{})["nodeBootIDs"] = map[string]interface{}{"cp-anchor": managerBoot, "worker-1": workerBoot}
 	dynClient := dynamicfake.NewSimpleDynamicClient(scheme, csdObj)
 
 	reconciler := NewClusterReconciler(client, dynClient, &mockUPSClient{}, ReconcilerConfig{
 		AnchorNode: "cp-anchor",
+		HostBootID: managerBoot,
 	})
 
 	err := reconciler.reconcile(ctx)
@@ -193,7 +205,7 @@ func TestReconciler_KillpowerClampingAndFinalizing(t *testing.T) {
 	ctx := context.Background()
 	scheme := newTestScheme()
 
-	client := fake.NewSimpleClientset()
+	client := fake.NewSimpleClientset(safetyNode("cp-anchor", managerBoot))
 	mockUPS := &mockUPSClient{}
 
 	csdObj := createTestCSD("csd-finalizing", v1alpha1.PhaseFinalizing, false)
@@ -201,6 +213,7 @@ func TestReconciler_KillpowerClampingAndFinalizing(t *testing.T) {
 
 	reconciler := NewClusterReconciler(client, dynClient, mockUPS, ReconcilerConfig{
 		AnchorNode: "cp-anchor",
+		HostBootID: managerBoot,
 	})
 
 	err := reconciler.reconcile(ctx)
@@ -234,6 +247,7 @@ func TestClusterReconciler_Health(t *testing.T) {
 
 	reconciler := NewClusterReconciler(client, dynClient, mockUPS, ReconcilerConfig{
 		AnchorNode:   "cp-anchor",
+		HostBootID:   managerBoot,
 		PollInterval: 10 * time.Millisecond,
 	})
 

@@ -6,7 +6,21 @@ on:
       - 'v*'
 
 jobs:
+  safety-checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify shutdown safety
+        run: go test -mod=vendor -race ./pkg/bootid ./pkg/agent ./pkg/manager/ups ./pkg/manager/reconciler
+
   build-and-push:
+    needs: safety-checks
     runs-on: ubuntu-latest
     permissions:
       contents: read

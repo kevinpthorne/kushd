@@ -10,6 +10,7 @@ import (
 
 	"kushd/pkg/agent"
 	"kushd/pkg/agent/power"
+	"kushd/pkg/bootid"
 	"kushd/pkg/k8sutil"
 )
 
@@ -38,6 +39,12 @@ func main() {
 		sysrqTriggerPath = "/host/proc/sysrq-trigger"
 	}
 
+	hostBootID, err := bootid.Read(hostRootPath)
+	if err != nil {
+		slog.Error("Cannot authorize shutdown actions without host boot identity", "error", err)
+		os.Exit(1)
+	}
+
 	// Initialize secure Kubernetes client (strict TLS)
 	clientset, _, err := k8sutil.NewClientset()
 	if err != nil {
@@ -60,9 +67,9 @@ func main() {
 	defer powerController.Close()
 
 	agentConfig := agent.AgentConfig{
-		NodeName:            nodeName,
-		PollInterval:        2 * time.Second,
-		PowerControllerOpts: powerOpts,
+		NodeName:     nodeName,
+		PollInterval: 2 * time.Second,
+		HostBootID:   hostBootID,
 	}
 
 	kushdAgent := agent.NewAgent(clientset, agentConfig, powerController)

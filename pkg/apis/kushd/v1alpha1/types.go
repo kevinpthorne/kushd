@@ -11,9 +11,13 @@ const (
 	Version   = "v1alpha1"
 
 	// Annotation keys
-	AnnotationStage        = "kushd.io/stage"
-	AnnotationDrainTimeout = "kushd.io/drain-timeout"
-	AnnotationAgentStatus  = "kushd.io/agent-status"
+	AnnotationStage           = "kushd.io/stage"
+	AnnotationDrainTimeout    = "kushd.io/drain-timeout"
+	AnnotationAgentStatus     = "kushd.io/agent-status"
+	AnnotationDirectiveBootID = "kushd.io/directive-boot-id"
+	AnnotationAgentBootID     = "kushd.io/agent-boot-id"
+	AnnotationShutdownUID     = "kushd.io/shutdown-uid"
+	AnnotationCordonOwner     = "kushd.io/cordoned-by"
 
 	// Stage values (Manager -> Agent)
 	StageIdle  = "idle"
@@ -97,6 +101,8 @@ type ClusterShutdownStatus struct {
 	StartTime          *metav1.Time         `json:"startTime,omitempty"`
 	CompletionTime     *metav1.Time         `json:"completionTime,omitempty"`
 	AnchorNode         string               `json:"anchorNode,omitempty"`
+	AnchorBootID       string               `json:"anchorBootID,omitempty"`
+	NodeBootIDs        map[string]string    `json:"nodeBootIDs,omitempty"`
 	Conditions         []Condition          `json:"conditions,omitempty"`
 }
 
@@ -140,6 +146,12 @@ func (in *ClusterShutdownStatus) DeepCopyInto(out *ClusterShutdownStatus) {
 	if in.CompletionTime != nil {
 		in, out := &in.CompletionTime, &out.CompletionTime
 		*out = (*in).DeepCopy()
+	}
+	if in.NodeBootIDs != nil {
+		out.NodeBootIDs = make(map[string]string, len(in.NodeBootIDs))
+		for node, id := range in.NodeBootIDs {
+			out.NodeBootIDs[node] = id
+		}
 	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions

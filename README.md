@@ -63,7 +63,7 @@ Abrupt power failure introduces severe data corruption risks: `etcd` split-brain
 1. **`kushd-manager` (Deployment)**:
    - Scheduled onto the control-plane node where the UPS is physically connected via Akri extended resource requests (`akri.sh/ups: 1`).
    - Runs two concurrent loops:
-     - **Hardware Poller Loop**: Monitors UPS state via Network UPS Tools (NUT) or USB HID. When battery drops below thresholds or `LOWBATT` is signaled, triggers a `ClusterShutdown` Custom Resource.
+     - **Hardware Poller Loop**: Monitors UPS state via Network UPS Tools (NUT) or USB HID. Automatic shutdown requires an explicit `OB` token, no `OL` token, and either `LB`/`LOWBATT` or a low positive charge/runtime reading. Low runtime while online, contradictory states, and missing readings do not trigger shutdown.
      - **Cluster Reconciler Loop**: Manages the shutdown state machine: cordons the cluster, instructs worker agents to drain and halt, orchestrates sequential N-1 control plane decommissioning, and handles final anchor host poweroff.
 
 2. **`kushd-agent` (Privileged DaemonSet)**:
@@ -81,11 +81,24 @@ Abrupt power failure introduces severe data corruption risks: `etcd` split-brain
 
 1. **Topology Placement Invariant**: Physical UPS communication hardware must terminate on a control-plane node. `kushd-manager` validates this on startup and exits cleanly (`os.Exit(1)`) without stack traces if scheduled on a worker node.
 2. **Akri-Driven Implicit Anchor Scheduling**: `kushd-manager` requests `akri.sh/ups: 1` alongside control-plane `nodeAffinity`. Kubernetes pins the manager to the node with the UPS without manual node labeling.
-3. **Point-of-No-Return**: Once worker node evacuation begins, abort requests (whether manual `spec.abort: true` or mains power restoration) are rejected with an `AbortRejected` status condition and Kubernetes Warning event to prevent partitioned cluster states.
+3. **Point-of-No-Return**: Once worker node evacuation begins, normal abort requests (whether manual `spec.abort: true` or mains power restoration) are rejected with an `AbortRejected` status condition and Kubernetes Warning event. A boot or node-inventory mismatch invalidates the old workflow even after this point; it must never power off a recovering cluster.
 4. **Configurable Power Cut (`killpower`)**: `enableKillpower` defaults to `false` to preserve battery reserves for auxiliary rack equipment. When enabled, `killpowerDelaySeconds` is safely clamped to $\ge 180$ seconds to account for `systemd` stop jobs on hung network mounts.
 5. **Strict TLS Enforcement**: Kubernetes API access strictly verifies TLS certificates at all times; insecure verification is forbidden.
+6. **Host Boot Binding**: Before changing nodes, the manager persists the anchor's host boot ID and a snapshot of every node's boot ID. Drain/halt directives carry the target boot ID and shutdown UID; acknowledgements carry the agent's actual host boot ID. Both processes require `/host/proc/sys/kernel/random/boot_id`, without a container-local fallback. Same-boot process restarts can resume; host reboots invalidate old work. There is no uptime timer.
+7. **Scoped Recovery**: Recovery only removes directives and cordons owned by the affected shutdown UID. Existing administrator cordons are never claimed or automatically cleared.
 
 ---
+## Safety upgrade from v1.0.8 or earlier
+
+1. Keep the manager and agents stopped while recovering nodes. Disable GitOps reconciliation so it cannot undo the pause.
+2. Apply `charts/kushd/crds/clustershutdowns.kushd.io.yaml` before resuming either component. Helm does not upgrade existing CRDs automatically; the new status boot-binding fields must not be pruned by the API server.
+3. Upgrade **both** manager and agent to v1.0.9 while paused. Mixed versions are unsafe: old agents do not enforce boot bindings.
+4. Resume only after cluster recovery is complete. Pre-existing unbound requests found at manager startup are aborted, including pending requests queued while it was stopped; resubmit intentional requests after startup. Review legacy cordons manually: unowned cordons are deliberately preserved.
+
+Publishing or installing the new chart is not permission to re-enable paused power automation.
+
+---
+
 
 ## Quickstart
 
@@ -133,8 +146,8 @@ Key values in `charts/kushd/values.yaml`:
 | `manager.akriResource` | `akri.sh/ups` | Akri extended resource name for the UPS hardware |
 | `manager.powerManagement.enableKillpower` | `false` | Whether to instruct the UPS to cut load power after node halts |
 | `manager.powerManagement.killpowerDelaySeconds` | `180` | Delay before UPS power cut (must be $\ge 180\text{s}$) |
-| `manager.thresholds.batteryLowPercent` | `20` | Battery charge percentage threshold triggering shutdown |
-| `manager.thresholds.runtimeLowSeconds` | `300` | Estimated battery runtime threshold triggering shutdown |
+| `manager.thresholds.batteryLowPercent` | `20` | Low positive battery charge threshold, only while explicitly on battery |
+| `manager.thresholds.runtimeLowSeconds` | `300` | Low positive estimated runtime threshold, only while explicitly on battery |
 | `manager.timeouts.workerEvacuationSeconds` | `120` | Evacuation window for worker nodes |
 | `manager.timeouts.controlPlaneEvacuationSeconds` | `60` | Evacuation window per control plane follower node |
 | `agent.securityContext.privileged` | `true` | Required for D-Bus and sysrq-trigger host access |

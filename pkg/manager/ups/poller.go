@@ -4,14 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"strings"
-	"sync"
-	"time"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/dynamic"
+	"log/slog"
+	"strings"
+	"sync"
+	"time"
 
 	"kushd/pkg/apis/kushd/v1alpha1"
 )
@@ -128,12 +128,22 @@ func (p *HardwarePoller) pollOnce(ctx context.Context) error {
 		return fmt.Errorf("failed to fetch UPS status: %w", err)
 	}
 
-	isLowBatt := strings.Contains(status.State, "LB") ||
-		strings.Contains(status.State, "LOWBATT") ||
+	isOnline, onBattery, lowBatteryFlag := false, false, false
+	for state := range strings.FieldsSeq(status.State) {
+		switch state {
+		case "OL":
+			isOnline = true
+		case "OB":
+			onBattery = true
+		case "LB", "LOWBATT":
+			lowBatteryFlag = true
+		}
+	}
+	// Runtime estimates also fluctuate on mains. They authorize shutdown only
+	// during an unambiguous on-battery condition; contradictory OL/OB fails safe.
+	isLowBatt := onBattery && !isOnline && (lowBatteryFlag ||
 		(status.BatteryChargePercent > 0 && status.BatteryChargePercent <= p.config.BatteryLowPercent) ||
-		(status.EstimatedRuntimeSeconds > 0 && status.EstimatedRuntimeSeconds <= p.config.RuntimeLowSeconds)
-
-	isOnline := strings.Contains(status.State, "OL")
+		(status.EstimatedRuntimeSeconds > 0 && status.EstimatedRuntimeSeconds <= p.config.RuntimeLowSeconds))
 
 	slog.Debug("Polled UPS status",
 		"state", status.State,
@@ -152,6 +162,7 @@ func (p *HardwarePoller) pollOnce(ctx context.Context) error {
 		if activeCSD == nil {
 			slog.Warn("UPS LOWBATT condition detected! Triggering new ClusterShutdown",
 				"batteryCharge", status.BatteryChargePercent,
+				"state", status.State,
 				"runtime", status.EstimatedRuntimeSeconds,
 			)
 			return p.createClusterShutdown(ctx, status)
@@ -210,7 +221,8 @@ func (p *HardwarePoller) createClusterShutdown(ctx context.Context, status *UPSS
 			Kind:       "ClusterShutdown",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:        name,
+			Annotations: map[string]string{"kushd.io/ups-state": status.State},
 		},
 		Spec: v1alpha1.ClusterShutdownSpec{
 			TriggerSource:           p.config.TriggerSourceName,

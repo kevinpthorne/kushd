@@ -4,26 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"sync"
-	"syscall"
-	"time"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
+	"log/slog"
+	"sync"
+	"syscall"
+	"time"
 
-	"kushd/pkg/agent/power"
 	"kushd/pkg/apis/kushd/v1alpha1"
 	"kushd/pkg/manager/ups"
 )
 
 type ReconcilerConfig struct {
 	AnchorNode      string
+	HostBootID      string
 	PollInterval    time.Duration
 	DryRun          bool
-	PowerController *power.HostPowerController
+	PowerController hostPowerController
+}
+
+type hostPowerController interface {
+	HaltHost(context.Context)
 }
 
 type ClusterReconciler struct {
@@ -123,11 +127,20 @@ func (r *ClusterReconciler) reconcile(ctx context.Context) error {
 		if csd.Status.Phase == v1alpha1.PhaseCompleted ||
 			csd.Status.Phase == v1alpha1.PhaseAborted ||
 			csd.Status.Phase == v1alpha1.PhaseFailed {
+			if csd.Status.Phase != v1alpha1.PhaseCompleted || csd.Status.AnchorBootID != r.config.HostBootID {
+				if err := r.releaseOwnedState(ctx, csd.UID); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 
 		if err := r.reconcileCSD(ctx, &csd); err != nil {
 			slog.Error("Failed to reconcile ClusterShutdown", "name", csd.Name, "phase", csd.Status.Phase, "error", err)
+			r.mu.Lock()
+			r.lastReconcileErr = err
+			r.mu.Unlock()
+			return err
 		}
 	}
 
@@ -136,27 +149,27 @@ func (r *ClusterReconciler) reconcile(ctx context.Context) error {
 
 func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.ClusterShutdown) error {
 	slog.Info("Reconciling ClusterShutdown", "name", csd.Name, "phase", csd.Status.Phase, "abort", csd.Spec.Abort)
+	if csd.Spec.Abort && (csd.Status.Phase == "" || csd.Status.Phase == v1alpha1.PhasePending ||
+		csd.Status.Phase == v1alpha1.PhaseCordoningCluster) {
+		if err := r.releaseOwnedState(ctx, csd.UID); err != nil {
+			return err
+		}
+		return r.transitionPhase(ctx, csd, v1alpha1.PhaseAborted)
+	}
+	bound, err := r.ensureBootBinding(ctx, csd)
+	if err != nil || !bound {
+		return err
+	}
 
 	switch csd.Status.Phase {
 	case "", v1alpha1.PhasePending:
-		if csd.Spec.Abort {
-			slog.Info("Shutdown aborted in Pending phase", "name", csd.Name)
-			return r.transitionPhase(ctx, csd, v1alpha1.PhaseAborted)
-		}
 		return r.transitionPhase(ctx, csd, v1alpha1.PhaseCordoningCluster)
 
 	case v1alpha1.PhaseCordoningCluster:
-		if csd.Spec.Abort {
-			slog.Info("Shutdown aborted in CordoningCluster phase; uncordoning cluster", "name", csd.Name)
-			if err := r.setClusterCordon(ctx, false); err != nil {
-				slog.Error("Failed to uncordon cluster on abort", "error", err)
-			}
-			return r.transitionPhase(ctx, csd, v1alpha1.PhaseAborted)
-		}
 
 		slog.Info("Cordoning all cluster nodes", "name", csd.Name)
 		if !csd.Spec.DryRun && !r.config.DryRun {
-			if err := r.setClusterCordon(ctx, true); err != nil {
+			if err := r.cordonNodes(ctx, csd); err != nil {
 				return fmt.Errorf("failed to cordon cluster nodes: %w", err)
 			}
 		}
@@ -182,15 +195,12 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 			// Signal workers to drain
 			allDrained := true
 			for _, node := range workers {
-				stage := node.Annotations[v1alpha1.AnnotationStage]
-				status := node.Annotations[v1alpha1.AnnotationAgentStatus]
-
-				if stage != v1alpha1.StageDrain {
-					if err := r.annotateNodeStage(ctx, node.Name, v1alpha1.StageDrain, timeoutStr); err != nil {
+				if !directiveMatches(&node, csd, v1alpha1.StageDrain) {
+					if err := r.annotateNodeStage(ctx, csd, node.Name, v1alpha1.StageDrain, timeoutStr); err != nil {
 						slog.Error("Failed to annotate worker node for drain", "node", node.Name, "error", err)
 					}
 					allDrained = false
-				} else if status != v1alpha1.AgentStatusDrained {
+				} else if !agentAcknowledged(&node, csd, v1alpha1.StageDrain, v1alpha1.AgentStatusDrained) {
 					allDrained = false
 				}
 			}
@@ -214,9 +224,9 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 
 		if !csd.Spec.DryRun && !r.config.DryRun {
 			for _, node := range workers {
-				if node.Annotations[v1alpha1.AnnotationStage] != v1alpha1.StageHalt {
-					if err := r.annotateNodeStage(ctx, node.Name, v1alpha1.StageHalt, ""); err != nil {
-						slog.Error("Failed to annotate worker node for halt", "node", node.Name, "error", err)
+				if !directiveMatches(&node, csd, v1alpha1.StageHalt) {
+					if err := r.annotateNodeStage(ctx, csd, node.Name, v1alpha1.StageHalt, ""); err != nil {
+						return fmt.Errorf("failed to dispatch worker halt to %s: %w", node.Name, err)
 					}
 				}
 			}
@@ -242,16 +252,13 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 		if !csd.Spec.DryRun && !r.config.DryRun {
 			// Sequential N-1 Drain: process followers one by one
 			for _, node := range followers {
-				status := node.Annotations[v1alpha1.AnnotationAgentStatus]
-				stage := node.Annotations[v1alpha1.AnnotationStage]
-
-				if status == v1alpha1.AgentStatusDrained {
+				if agentAcknowledged(&node, csd, v1alpha1.StageDrain, v1alpha1.AgentStatusDrained) {
 					continue
 				}
 
-				if stage != v1alpha1.StageDrain {
+				if !directiveMatches(&node, csd, v1alpha1.StageDrain) {
 					slog.Info("Draining CP follower node", "node", node.Name)
-					if err := r.annotateNodeStage(ctx, node.Name, v1alpha1.StageDrain, timeoutStr); err != nil {
+					if err := r.annotateNodeStage(ctx, csd, node.Name, v1alpha1.StageDrain, timeoutStr); err != nil {
 						return err
 					}
 				}
@@ -274,10 +281,10 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 
 		if !csd.Spec.DryRun && !r.config.DryRun {
 			for _, node := range followers {
-				if node.Annotations[v1alpha1.AnnotationStage] != v1alpha1.StageHalt {
+				if !directiveMatches(&node, csd, v1alpha1.StageHalt) {
 					slog.Info("Halting CP follower node", "node", node.Name)
-					if err := r.annotateNodeStage(ctx, node.Name, v1alpha1.StageHalt, ""); err != nil {
-						slog.Error("Failed to annotate CP follower node for halt", "node", node.Name, "error", err)
+					if err := r.annotateNodeStage(ctx, csd, node.Name, v1alpha1.StageHalt, ""); err != nil {
+						return fmt.Errorf("failed to dispatch control-plane halt to %s: %w", node.Name, err)
 					}
 				}
 			}
@@ -313,8 +320,12 @@ func (r *ClusterReconciler) reconcileCSD(ctx context.Context, csd *v1alpha1.Clus
 
 		if !csd.Spec.DryRun && !r.config.DryRun && r.config.AnchorNode != "" {
 			slog.Info("ClusterShutdown completed successfully; halting anchor node", "anchorNode", r.config.AnchorNode)
-			_ = r.annotateNodeStage(ctx, r.config.AnchorNode, v1alpha1.StageHalt, "")
-			_ = r.transitionPhase(ctx, csd, v1alpha1.PhaseCompleted)
+			if err := r.annotateNodeStage(ctx, csd, r.config.AnchorNode, v1alpha1.StageHalt, ""); err != nil {
+				return err
+			}
+			if err := r.transitionPhase(ctx, csd, v1alpha1.PhaseCompleted); err != nil {
+				slog.Warn("Could not persist completion after control-plane halt directives", "error", err)
+			}
 			if r.config.PowerController != nil {
 				slog.Info("Halting anchor node host in-process via HostPowerController", "anchorNode", r.config.AnchorNode)
 				r.config.PowerController.HaltHost(ctx)
@@ -416,8 +427,16 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, csd *v1alpha1.Clus
 	}
 
 	statusMap := map[string]interface{}{
-		"phase":      string(csd.Status.Phase),
-		"anchorNode": csd.Status.AnchorNode,
+		"phase":        string(csd.Status.Phase),
+		"anchorNode":   csd.Status.AnchorNode,
+		"anchorBootID": csd.Status.AnchorBootID,
+	}
+	if csd.Status.NodeBootIDs != nil {
+		bindings := make(map[string]interface{}, len(csd.Status.NodeBootIDs))
+		for node, id := range csd.Status.NodeBootIDs {
+			bindings[node] = id
+		}
+		statusMap["nodeBootIDs"] = bindings
 	}
 	if csd.Status.StartTime != nil {
 		statusMap["startTime"] = csd.Status.StartTime.Format(time.RFC3339)
@@ -444,53 +463,46 @@ func (r *ClusterReconciler) updateStatus(ctx context.Context, csd *v1alpha1.Clus
 	return err
 }
 
-func (r *ClusterReconciler) setClusterCordon(ctx context.Context, unschedulable bool) error {
-	nodes, err := r.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+func (r *ClusterReconciler) annotateNodeStage(ctx context.Context, csd *v1alpha1.ClusterShutdown, nodeName, stage, timeout string) error {
+	id := csd.Status.NodeBootIDs[nodeName]
+	if id == "" || csd.UID == "" {
+		return fmt.Errorf("cannot issue an unbound shutdown directive")
+	}
+	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
-
-	for _, node := range nodes.Items {
-		if node.Spec.Unschedulable == unschedulable {
-			continue
-		}
-		patch := map[string]interface{}{
-			"spec": map[string]interface{}{
-				"unschedulable": unschedulable,
-			},
-		}
-		bytes, err := json.Marshal(patch)
-		if err != nil {
-			continue
-		}
-		_, err = r.client.CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, bytes, metav1.PatchOptions{})
-		if err != nil {
-			slog.Error("Failed to update node cordon status", "node", node.Name, "unschedulable", unschedulable, "error", err)
-		}
+	if node.Status.NodeInfo.BootID != id {
+		return fmt.Errorf("node %s boot changed before directive dispatch", nodeName)
 	}
-	return nil
-}
-
-func (r *ClusterReconciler) annotateNodeStage(ctx context.Context, nodeName, stage, timeout string) error {
-	annotations := map[string]string{
-		v1alpha1.AnnotationStage: stage,
+	if owner := node.Annotations[v1alpha1.AnnotationShutdownUID]; owner != "" && owner != string(csd.UID) {
+		return fmt.Errorf("node %s has another shutdown's directive", nodeName)
+	}
+	if directiveMatches(node, csd, stage) {
+		return nil
+	}
+	annotations := map[string]interface{}{
+		v1alpha1.AnnotationStage:           stage,
+		v1alpha1.AnnotationDirectiveBootID: id,
+		v1alpha1.AnnotationShutdownUID:     string(csd.UID),
+		v1alpha1.AnnotationAgentStatus:     nil,
+		v1alpha1.AnnotationAgentBootID:     nil,
+		v1alpha1.AnnotationDrainTimeout:    nil,
 	}
 	if timeout != "" {
 		annotations[v1alpha1.AnnotationDrainTimeout] = timeout
 	}
-
 	patch := map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"annotations": annotations,
+			"resourceVersion": node.ResourceVersion,
+			"annotations":     annotations,
 		},
 	}
-
-	bytes, err := json.Marshal(patch)
+	data, err := json.Marshal(patch)
 	if err != nil {
 		return err
 	}
-
-	_, err = r.client.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, bytes, metav1.PatchOptions{})
+	_, err = r.client.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, data, metav1.PatchOptions{})
 	return err
 }
 
@@ -530,57 +542,45 @@ func (r *ClusterReconciler) getControlPlaneFollowers(ctx context.Context) ([]cor
 	return followers, nil
 }
 
-// RecoverClusterOnStartup checks whether the cluster recently completed a shutdown
-// and resets node cordons and stage annotations to idle if no active shutdown is in progress.
+// RecoverClusterOnStartup retires old-boot shutdowns and releases only the state
+// owned by completed or cancelled workflows, never an administrator's cordon.
 func (r *ClusterReconciler) RecoverClusterOnStartup(ctx context.Context) error {
 	list, err := r.dynClient.Resource(v1alpha1.ClusterShutdownGVR).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list clustershutdowns: %w", err)
 	}
-
-	hasActive := false
 	for _, item := range list.Items {
 		var csd v1alpha1.ClusterShutdown
 		data, err := item.MarshalJSON()
 		if err != nil {
-			continue
+			return err
 		}
 		if err := json.Unmarshal(data, &csd); err != nil {
-			continue
+			return err
 		}
-		if csd.Status.Phase != v1alpha1.PhaseCompleted &&
-			csd.Status.Phase != v1alpha1.PhaseAborted &&
-			csd.Status.Phase != v1alpha1.PhaseFailed {
-			hasActive = true
-			break
-		}
-	}
-
-	if !hasActive {
-		slog.Info("Startup check: No active ClusterShutdown in progress; ensuring nodes are uncordoned and idle")
-		if err := r.setClusterCordon(ctx, false); err != nil {
-			slog.Warn("Failed to uncordon nodes on startup", "error", err)
-		}
-		if err := r.resetAllNodesStage(ctx, v1alpha1.StageIdle); err != nil {
-			slog.Warn("Failed to reset node stages on startup", "error", err)
-		}
-	}
-
-	return nil
-}
-
-func (r *ClusterReconciler) resetAllNodesStage(ctx context.Context, stage string) error {
-	nodes, err := r.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-	for _, node := range nodes.Items {
-		currentStage := node.Annotations[v1alpha1.AnnotationStage]
-		if currentStage == "" || currentStage == stage {
-			continue
-		}
-		if err := r.annotateNodeStage(ctx, node.Name, stage, ""); err != nil {
-			slog.Warn("Failed to reset node stage", "node", node.Name, "error", err)
+		switch csd.Status.Phase {
+		case v1alpha1.PhaseAborted, v1alpha1.PhaseFailed:
+			if err := r.releaseOwnedState(ctx, csd.UID); err != nil {
+				return err
+			}
+		case v1alpha1.PhaseCompleted:
+			if csd.Status.AnchorBootID != r.config.HostBootID {
+				if err := r.releaseOwnedState(ctx, csd.UID); err != nil {
+					return err
+				}
+			}
+		default:
+			// Pre-existing unbound requests cannot prove which boot authorized them.
+			// Only requests first observed after startup may acquire a new binding.
+			if csd.Status.AnchorBootID == "" || len(csd.Status.NodeBootIDs) == 0 {
+				if err := r.retireBootBinding(ctx, &csd, "MissingBootIdentity", "Queued shutdown has no durable boot binding"); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := r.ensureBootBinding(ctx, &csd); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

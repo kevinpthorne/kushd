@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"kushd/pkg/agent/power"
+	"kushd/pkg/bootid"
 	"kushd/pkg/k8sutil"
 	"kushd/pkg/manager/health"
 	"kushd/pkg/manager/reconciler"
@@ -117,6 +118,11 @@ func main() {
 	if hostRootPath == "" {
 		hostRootPath = "/host"
 	}
+	hostBootID, err := bootid.Read(hostRootPath)
+	if err != nil {
+		slog.Error("Cannot authorize shutdown actions without host boot identity", "error", err)
+		os.Exit(1)
+	}
 	dbusSocketPath := os.Getenv("DBUS_SOCKET_PATH")
 	if dbusSocketPath == "" {
 		dbusSocketPath = "/host/run/dbus/system_bus_socket"
@@ -141,15 +147,17 @@ func main() {
 	// 5. Cluster Reconciler Loop
 	reconcilerConfig := reconciler.ReconcilerConfig{
 		AnchorNode:      nodeName,
+		HostBootID:      hostBootID,
 		PollInterval:    2 * time.Second,
 		DryRun:          dryRun,
 		PowerController: powerController,
 	}
 	clusterReconciler := reconciler.NewClusterReconciler(clientset, dynClient, nutClient, reconcilerConfig)
 
-	// Run startup recovery check (uncordon nodes if no active shutdown)
+	// Recover only shutdown-owned state before starting either control loop.
 	if err := clusterReconciler.RecoverClusterOnStartup(ctx); err != nil {
-		slog.Warn("Startup cluster recovery check encountered non-fatal error", "error", err)
+		slog.Error("Startup shutdown recovery failed; refusing to run power automation", "error", err)
+		os.Exit(1)
 	}
 
 	// 6. Health Check Server
